@@ -81,6 +81,9 @@ SCHEMAS: dict[str, dict[str, pl.DataType]] = {
         "ict_index": pl.Float64,
         "bonus_final": pl.Boolean,
     },
+    # Season-to-date totals, not a live line. bootstrap-static is the only
+    # endpoint carrying a player's accumulated xG/ICT, and it is what the
+    # Players tab reads.
     "fpl_players": {
         "captured_at": TS,
         "fpl_id": pl.Int32,
@@ -95,6 +98,37 @@ SCHEMAS: dict[str, dict[str, pl.DataType]] = {
         "total_points": pl.Int32,
         "status": pl.Utf8,
         "chance_next_round": pl.Int32,
+        # --- season totals ---
+        "minutes": pl.Int32,
+        "starts": pl.Int32,
+        "goals_scored": pl.Int32,
+        "assists": pl.Int32,
+        "bonus": pl.Int32,
+        "bps": pl.Int32,
+        "xg": pl.Float64,
+        "xa": pl.Float64,
+        "xgi": pl.Float64,
+        "xgc": pl.Float64,
+        # ICT and its three components. creativity is the closest thing FPL
+        # publishes to key passes — it is Opta's chance-creation index, and no
+        # raw key-pass count exists anywhere in this API.
+        "influence": pl.Float64,
+        "creativity": pl.Float64,
+        "threat": pl.Float64,
+        "ict_index": pl.Float64,
+        # --- per 90, as FPL computes them ---
+        "xg_per_90": pl.Float64,
+        "xa_per_90": pl.Float64,
+        "xgi_per_90": pl.Float64,
+        # --- defensive ---
+        "tackles": pl.Int32,
+        "recoveries": pl.Int32,
+        "cbi": pl.Int32,
+        "defensive_contribution": pl.Int32,
+        # --- value ---
+        "points_per_game": pl.Float64,
+        "value_season": pl.Float64,
+        "ep_next": pl.Float64,
     },
 }
 

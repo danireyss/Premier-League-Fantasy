@@ -145,6 +145,37 @@ def fantasy_board(window_minutes: int = 15) -> pl.DataFrame:
     ).sort("total_points", descending=True, nulls_last=True)
 
 
+def player_board() -> pl.DataFrame:
+    """Season-to-date totals for every player, one row each.
+
+    Reads the slow loop's bootstrap snapshots rather than the live table: these
+    are accumulated season figures, and only bootstrap-static carries them.
+
+    A note on key passes: FPL publishes no raw key-pass count — no pass, shot or
+    chance-creation counter exists anywhere in the API. `creativity` is Opta's
+    chance-creation index and `xa` the expected value of chances created; those
+    two are the honest stand-ins, and xa is arguably the better metric anyway
+    since it weights the quality of a chance rather than counting it.
+    """
+    board = _latest_per(store.scan("fpl_players"), ["fpl_id"]).collect()
+    if board.is_empty():
+        return board
+
+    per_90 = pl.col("minutes") / 90
+    return board.with_columns(
+        (pl.col("now_cost") / 10).alias("price"),
+        # FPL ships per-90s for xG/xA/xGI only; derive the rest ourselves, and
+        # only where a player has actually played enough for it to mean anything.
+        *[
+            pl.when(pl.col("minutes") >= 90)
+            .then(pl.col(c) / per_90)
+            .otherwise(None)
+            .alias(f"{c}_per_90")
+            for c in ("ict_index", "creativity", "threat", "influence")
+        ],
+    ).sort("total_points", descending=True, nulls_last=True)
+
+
 def price_watch(hours: int = 24) -> pl.DataFrame:
     """Players whose price or ownership has moved since the oldest snapshot in
     the window. Only the slow loop feeds this, so it updates a few times a day."""
