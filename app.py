@@ -56,6 +56,44 @@ def _compare(min_minutes: int, per_90: bool) -> pl.DataFrame:
     return queries.compare_board(min_minutes, per_90)
 
 
+def _name_match(term: str) -> pl.Expr:
+    """Search both the display name and the full one.
+
+    FPL's `web_name` is the surname alone for most players, so a search for
+    "geovany quenda" — or any first name — misses a player who is plainly
+    there. `full_name` carries both halves.
+    """
+    needle = term.strip().lower()
+    return pl.any_horizontal(
+        pl.col(c).fill_null("").str.to_lowercase().str.contains(needle, literal=True)
+        for c in ("web_name", "full_name")
+    )
+
+
+def _excluded_note(named: pl.DataFrame, min_mins: int, max_price: float,
+                   pos_pick: list[str]) -> str:
+    """Why the players a search found were then filtered away.
+
+    Worth spelling out: the default 90-minute bar hides every squad player who
+    has only come off the bench, and "no players match those filters" gives no
+    hint that the player exists and it was the bar that removed him.
+    """
+    reasons = []
+    for r in named.unique(subset=["fpl_id"], keep="first").head(4).iter_rows(named=True):
+        if r["minutes"] < min_mins:
+            why = f"{r['minutes']} minutes played, under the {min_mins} bar"
+        elif r["price"] > max_price:
+            why = f"£{r['price']:.1f}m, over the £{max_price:.1f}m cap"
+        elif pos_pick and r["position"] not in pos_pick:
+            why = f"a {r['position']}, not in the position filter"
+        else:
+            why = "not expected on the pitch for these fixtures"
+        reasons.append(f"**{r['web_name']}** ({r['team_name']}) — {why}")
+    found = named["fpl_id"].n_unique()
+    more = f" …and {found - 4} more." if found > 4 else ""
+    return "Found, but filtered out: " + "; ".join(reasons) + "." + more
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def _projections(gws: tuple[int, ...]) -> pl.DataFrame:
     return queries.projections(list(gws))
@@ -396,7 +434,7 @@ with players:
 
         search = st.text_input("Search player", placeholder="surname…")
         if search:
-            view = view.filter(pl.col("web_name").str.to_lowercase().str.contains(search.lower()))
+            view = view.filter(_name_match(search))
 
         if view.is_empty():
             st.warning("No players match those filters.")
@@ -735,7 +773,7 @@ with projection:
             "so the two can be compared."
         )
 
-        g1, g2, g3, g4 = st.columns([2.2, 2, 1.6, 1.6])
+        g1, g2, g3, g4, g5 = st.columns([2.2, 1.8, 1.4, 1.4, 1.8])
         with g1:
             gws = st.multiselect(
                 "Gameweeks",
@@ -760,6 +798,10 @@ with projection:
                      "these, so a low bar lets in players whose numbers rest on "
                      "a cameo.",
             )
+        with g5:
+            name_search = st.text_input(
+                "Search player", placeholder="surname…", key="proj_search"
+            )
 
         if not gws:
             st.info("Pick at least one gameweek.")
@@ -773,7 +815,12 @@ with projection:
                     "has finished."
                 )
             else:
-                view = proj.filter(
+                # The name search runs first and alone, so that when the
+                # other filters then empty the result we can say which player
+                # was found and what excluded him — a bare "no matches" reads
+                # as the player being absent from the data entirely.
+                named = proj.filter(_name_match(name_search)) if name_search else proj
+                view = named.filter(
                     (pl.col("minutes") >= min_mins)
                     & (pl.col("price") <= max_price)
                     & (pl.col("xmins") > 0)
@@ -782,7 +829,12 @@ with projection:
                     view = view.filter(pl.col("position").is_in(pos_pick))
 
                 if view.is_empty():
-                    st.warning("No players match those filters.")
+                    if name_search and not named.is_empty():
+                        st.warning(_excluded_note(named, min_mins, max_price, pos_pick))
+                    elif name_search:
+                        st.warning(f"No player's name contains “{name_search.strip()}”.")
+                    else:
+                        st.warning("No players match those filters.")
                 else:
                     # One row per player per fixture, so a run of gameweeks —
                     # and a double inside one — collapses by summing.
