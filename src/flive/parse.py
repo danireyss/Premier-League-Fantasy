@@ -248,6 +248,88 @@ def fpl_player_rows(bootstrap: dict, captured_at: datetime) -> list[dict]:
             "points_per_game": _f(el.get("points_per_game")),
             "value_season": _f(el.get("value_season")),
             "ep_next": _f(el.get("ep_next")),
+            "clean_sheets": _i(el.get("clean_sheets")),
+            "goals_conceded": _i(el.get("goals_conceded")),
+            "own_goals": _i(el.get("own_goals")),
+            "saves": _i(el.get("saves")),
+            "yellow_cards": _i(el.get("yellow_cards")),
+            "red_cards": _i(el.get("red_cards")),
+            "penalties_saved": _i(el.get("penalties_saved")),
+            "penalties_missed": _i(el.get("penalties_missed")),
+            "xgc_per_90": _f(el.get("expected_goals_conceded_per_90")),
+            "saves_per_90": _f(el.get("saves_per_90")),
+            "goals_conceded_per_90": _f(el.get("goals_conceded_per_90")),
+            "starts_per_90": _f(el.get("starts_per_90")),
+            "clean_sheets_per_90": _f(el.get("clean_sheets_per_90")),
+            "defensive_contribution_per_90": _f(
+                el.get("defensive_contribution_per_90")
+            ),
+            "penalties_order": _i(el.get("penalties_order")),
+            "corners_order": _i(el.get("corners_and_indirect_freekicks_order")),
+            "freekicks_order": _i(el.get("direct_freekicks_order")),
+            "news": el.get("news") or None,
+            "ep_this": _f(el.get("ep_this")),
         }
         for el in bootstrap.get("elements", [])
     ]
+
+
+def fpl_team_rows(bootstrap: dict, captured_at: datetime) -> list[dict]:
+    """One row per club. Kept for reference, not for the model.
+
+    FPL ships the attack/defence strength fields as 0 for most of a season and
+    never fills in played/won/drawn at all, so nothing here can be relied on.
+    The projection derives its own club ratings from player totals instead.
+    """
+    return [
+        {
+            "captured_at": captured_at,
+            "team_id": t.get("id"),
+            "name": t.get("name"),
+            "short_name": t.get("short_name"),
+            "strength": _i(t.get("strength")),
+            "strength_overall_home": _i(t.get("strength_overall_home")),
+            "strength_overall_away": _i(t.get("strength_overall_away")),
+            "strength_attack_home": _i(t.get("strength_attack_home")),
+            "strength_attack_away": _i(t.get("strength_attack_away")),
+            "strength_defence_home": _i(t.get("strength_defence_home")),
+            "strength_defence_away": _i(t.get("strength_defence_away")),
+        }
+        for t in bootstrap.get("teams", [])
+    ]
+
+
+def schedule_rows(
+    fixtures: list[dict], names: dict[int, str], captured_at: datetime
+) -> list[dict]:
+    """The fixture list, played and unplayed.
+
+    Distinct from fixture_rows: that one is a tick of a match in progress, this
+    is the schedule. A fixture with no `event` is one FPL has not scheduled yet
+    (a postponement awaiting a new date) and is dropped — a projection cannot
+    place it in a gameweek.
+    """
+    out = []
+    for fx in fixtures:
+        if fx.get("event") is None:
+            continue
+        h, a = fx.get("team_h"), fx.get("team_a")
+        out.append(
+            {
+                "captured_at": captured_at,
+                "fixture_id": fx.get("id"),
+                "gw": fx.get("event"),
+                "kickoff_time": _ts(fx.get("kickoff_time")),
+                "home_team_id": h,
+                "away_team_id": a,
+                "home_name": names.get(h),
+                "away_name": names.get(a),
+                "home_difficulty": _i(fx.get("team_h_difficulty")),
+                "away_difficulty": _i(fx.get("team_a_difficulty")),
+                "home_score": _i(fx.get("team_h_score")),
+                "away_score": _i(fx.get("team_a_score")),
+                "started": bool(fx.get("started")),
+                "finished": bool(fx.get("finished")),
+            }
+        )
+    return out

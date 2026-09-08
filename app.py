@@ -12,7 +12,7 @@ import altair as alt
 import polars as pl
 import streamlit as st
 
-from flive import queries
+from flive import project, queries
 
 st.set_page_config(page_title="Live match analysis", layout="wide")
 
@@ -51,6 +51,55 @@ def _players() -> pl.DataFrame:
     return queries.player_board()
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _compare(min_minutes: int, per_90: bool) -> pl.DataFrame:
+    return queries.compare_board(min_minutes, per_90)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _projections(gws: tuple[int, ...]) -> pl.DataFrame:
+    return queries.projections(list(gws))
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _gameweeks() -> list[int]:
+    return queries.upcoming_gameweeks()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _strength() -> pl.DataFrame:
+    return queries.team_strength()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _results(limit: int) -> pl.DataFrame:
+    return queries.recent_results(limit)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _next_fixtures(limit: int) -> pl.DataFrame:
+    return queries.next_fixtures(limit)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _next_kickoff():
+    return queries.next_kickoff()
+
+
+def _kickoff_note() -> str:
+    """One line on when there will next be something live to show."""
+    when = _next_kickoff()
+    if when is None:
+        return "No fixtures left to play."
+    delta = when - queries.store.now()
+    hours = delta.total_seconds() / 3600
+    if hours < 0:
+        return "The next fixture has kicked off; the daemon polls every minute."
+    if hours < 24:
+        return f"Next kickoff is in about {hours:.0f} hours ({when:%a %H:%M UTC})."
+    return f"Next kickoff is {when:%a %d %b, %H:%M UTC} — in {hours / 24:.0f} days."
+
+
 # Categorical slots 1-3 of the reference palette, which are the three that clear
 # the all-pairs CVD and normal-vision floors a scatter needs. Goalkeepers are
 # left off the attacking chart anyway — their xG is 0.00 — so three is enough.
@@ -59,6 +108,46 @@ PALETTE = {
     "dark": ["#3987e5", "#d95926", "#199e70"],
 }
 OUTFIELD = ["DEF", "MID", "FWD"]
+
+# Slots 1-4. Grouped bars are read against their neighbours, so the adjacent
+# pairlist applies and the fourth slot is available here even though the scatter
+# above has to stop at three.
+COMPARE_PALETTE = {
+    "light": ["#2a78d6", "#eb6834", "#1baf7a", "#eda100"],
+    "dark": ["#3987e5", "#d95926", "#199e70", "#c98500"],
+}
+MAX_COMPARE = 4
+
+# The projection stack. Deductions take the red slot and everything else runs
+# in slot order: red reads as the negative pole, and the deduction segment is
+# the one that stacks left of zero. Validated on the pairs that actually touch
+# on screen — deductions | 0 | appearance, attack, defence, bonus — which is
+# not list order, since nothing ever renders yellow beside red.
+STACK = {
+    "light": {
+        "Appearance": "#2a78d6", "Attack": "#eb6834", "Defence": "#1baf7a",
+        "Bonus": "#eda100", "Deductions": "#e34948",
+    },
+    "dark": {
+        "Appearance": "#3987e5", "Attack": "#d95926", "Defence": "#199e70",
+        "Bonus": "#c98500", "Deductions": "#e66767",
+    },
+}
+# How the nine scoring components collapse into the five the chart stacks. The
+# table below it keeps all nine — past about seven classes adjacent colours
+# blur, and the detail belongs in a table anyway.
+STACK_OF = {
+    "pts_appearance": "Appearance",
+    "pts_goals": "Attack",
+    "pts_assists": "Attack",
+    "pts_clean_sheet": "Defence",
+    "pts_defcon": "Defence",
+    "pts_saves": "Defence",
+    "pts_bonus": "Bonus",
+    "pts_conceded": "Deductions",
+    "pts_cards": "Deductions",
+}
+STACK_ORDER = ["Appearance", "Attack", "Defence", "Bonus", "Deductions"]
 
 
 def _theme() -> str:
@@ -96,6 +185,23 @@ def _labels(df: pl.DataFrame, n: int = 6) -> pl.DataFrame:
     return pl.DataFrame(kept, schema=ranked.schema) if kept else ranked.head(0)
 
 
+def _slots(ids: list[int]) -> dict[int, int]:
+    """Hold each player's colour slot for as long as he is selected.
+
+    Colouring by position in the selection would repaint the survivors when one
+    player is dropped, and a reader who has learned that Salah is the blue bar
+    should not have to relearn it. Assign the lowest free slot on the way in,
+    release it on the way out.
+    """
+    held: dict[int, int] = st.session_state.setdefault("compare_slots", {})
+    for gone in [k for k in held if k not in ids]:
+        del held[gone]
+    for fpl_id in ids:
+        if fpl_id not in held:
+            held[fpl_id] = next(s for s in range(MAX_COMPARE) if s not in held.values())
+    return held
+
+
 with st.sidebar:
     st.subheader("Settings")
     window = st.slider("Momentum window (minutes)", 5, 45, 15, step=5)
@@ -111,7 +217,9 @@ with st.sidebar:
     if not any(counts.values()):
         st.warning("No data yet. Start the ingest daemon with `uv run flive-ingest`.")
 
-matches, players, fantasy, prices = st.tabs(["Matches", "Players", "Fantasy", "Prices"])
+matches, players, compare, projection, fantasy, prices = st.tabs(
+    ["Matches", "Players", "Compare", "Projection", "Fantasy", "Prices"]
+)
 
 
 with matches:
@@ -120,7 +228,64 @@ with matches:
     def live_panel() -> None:
         fx = _live_fixtures()
         if fx.is_empty():
-            st.info("No fixtures recorded yet. The daemon idles until kickoff.")
+            # The live loop writes only while a match is in progress, so
+            # between gameweeks these tables are empty and stay that way for
+            # days. The schedule is what there is to show, and it is not
+            # nothing: results just played, and what is coming.
+            st.info(
+                "Nothing has been in play since the daemon started, so there "
+                "are no live snapshots yet. " + _kickoff_note()
+            )
+            results, ahead = _results(10), _next_fixtures(10)
+            if results.is_empty() and ahead.is_empty():
+                st.caption(
+                    "No fixture list either — the slow loop writes it on its "
+                    "first tick."
+                )
+                return
+            left, right = st.columns(2)
+            with left:
+                st.subheader("Latest results")
+                if results.is_empty():
+                    st.caption("Nothing played yet this season.")
+                else:
+                    st.dataframe(
+                        results.select(
+                            pl.col("gw").alias("GW"),
+                            pl.col("home_name").alias("Home"),
+                            pl.col("home_score").alias("H"),
+                            pl.col("away_score").alias("A"),
+                            pl.col("away_name").alias("Away"),
+                        ),
+                        hide_index=True,
+                        width="stretch",
+                    )
+            with right:
+                st.subheader("Coming up")
+                if ahead.is_empty():
+                    st.caption("No fixtures scheduled.")
+                else:
+                    st.dataframe(
+                        ahead.select(
+                            pl.col("gw").alias("GW"),
+                            pl.col("kickoff_time").dt.strftime("%a %d %b %H:%M").alias("Kickoff"),
+                            pl.col("home_name").alias("Home"),
+                            pl.col("away_name").alias("Away"),
+                            # Not "H diff" — this table sits beside one whose
+                            # H and A columns hold scores, where "diff" reads
+                            # as goal difference.
+                            pl.col("home_difficulty").alias("Home FDR"),
+                            pl.col("away_difficulty").alias("Away FDR"),
+                        ),
+                        hide_index=True,
+                        width="stretch",
+                    )
+            st.caption(
+                "**FDR** is FPL's fixture difficulty rating — how hard the "
+                "match is for that side, 1 easiest to 5. The two differ "
+                "because it accounts for venue. Expected points for these "
+                "fixtures are on the Projection tab."
+            )
             return
 
         in_play = fx.filter(pl.col("state").is_in(queries.LIVE_STATES))
@@ -346,15 +511,495 @@ with players:
             )
 
 
+with compare:
+    pool = _players()
+    if pool.is_empty():
+        st.info(
+            "No player data yet. The slow loop writes this on its first tick — "
+            "start the ingest daemon with `uv run flive-ingest`."
+        )
+    else:
+        c1, c2, c3 = st.columns([5, 1.5, 2.5])
+        with c2:
+            cmp_basis = st.radio(
+                "Basis", ["Totals", "Per 90"], horizontal=True, key="cmp_basis"
+            )
+        with c3:
+            pool_max = int(pool["minutes"].max() or 0)
+            pool_min = st.slider(
+                "Peer pool: minimum minutes",
+                0,
+                max(pool_max, 1),
+                min(90, pool_max),
+                step=15,
+                help=(
+                    "Who a player is ranked against. Raising this drops cameo "
+                    "appearances out of the pool, so percentiles compare him "
+                    "against regulars rather than against everyone."
+                ),
+            )
+
+        cmp_per90 = cmp_basis == "Per 90"
+        board = _compare(pool_min, cmp_per90)
+        options = {
+            f"{r['web_name']} · {r['team_name']} ({r['position']})": r["fpl_id"]
+            for r in board.iter_rows(named=True)
+        }
+        with c1:
+            picked = st.multiselect(
+                "Players",
+                list(options),
+                max_selections=MAX_COMPARE,
+                placeholder="Pick two to four players…",
+            )
+
+        if len(picked) < 2:
+            st.info("Pick at least two players to compare.")
+        else:
+            ids = [options[label] for label in picked]
+            slots = _slots(ids)
+            rows = {
+                label: board.filter(pl.col("fpl_id") == options[label]).row(0, named=True)
+                for label in picked
+            }
+            # Short names for the chart; the full label stays on the cards.
+            short = {label: label.split(" · ")[0] for label in picked}
+            order = list(short.values())
+
+            theme = _theme()
+            colors = [COMPARE_PALETTE[theme][slots[options[label]]] for label in picked]
+            ink = "#52514e" if theme == "light" else "#c3c2b7"
+
+            sfx = " /90" if cmp_per90 else ""
+
+            cards = st.columns(len(picked))
+            for col, label in zip(cards, picked):
+                r = rows[label]
+                with col:
+                    st.markdown(
+                        f"<span style='color:{colors[picked.index(label)]};"
+                        f"font-size:1.6rem;line-height:0'>●</span> "
+                        f"**{r['web_name']}**  \n"
+                        f"{r['team_name']} · {r['position']} · £{r['price']:.1f}m",
+                        unsafe_allow_html=True,
+                    )
+                    st.caption(
+                        f"{r['minutes']:,} min · {r['total_points']} pts · "
+                        f"{r['selected_by_pct']:.1f}% owned"
+                    )
+
+            thin = [label for label in picked if rows[label]["minutes"] < pool_min]
+            if thin:
+                st.caption(
+                    "Below the pool threshold, so unranked: "
+                    + ", ".join(short[label] for label in thin)
+                    + ". Their raw numbers are in the table; the bars leave them out."
+                )
+
+            # --- percentile profile -------------------------------------------
+            plot = pl.DataFrame(
+                [
+                    {
+                        "player": short[label],
+                        "stat": stat,
+                        "pct": rows[label][f"p_{queries.COMPARE_STATS[stat][0]}"],
+                        "value": rows[label][f"v_{queries.COMPARE_STATS[stat][0]}"],
+                    }
+                    for stat in queries.PROFILE_STATS
+                    for label in picked
+                ],
+                schema={"player": pl.Utf8, "stat": pl.Utf8, "pct": pl.Float64, "value": pl.Float64},
+            ).drop_nulls("pct")
+
+            if plot.is_empty():
+                st.caption(
+                    "None of these players clears the pool threshold, so there is "
+                    "nothing to rank them against. Lower it, or read the table."
+                )
+            else:
+                pdf = plot.to_pandas()
+                # A fixed row height keeps the chart the same size whether two
+                # players or four are on it; the bars thin out instead. Letting
+                # Vega size the rows from the bar count collapsed the plot to
+                # 90px for two players and it silently dropped every other
+                # metric label.
+                ranked_n = plot["player"].n_unique()
+                row_h = 46
+                bar_h = min(16, int(34 / ranked_n))
+                ax = dict(
+                    grid=True, gridOpacity=0.18, gridColor=ink, tickCount=5,
+                    domain=False, ticks=False, labelColor=ink, titleColor=ink,
+                    labelFontSize=11, titleFontSize=12, titlePadding=8,
+                )
+                scale = alt.Scale(domain=order, range=colors)
+                base = alt.Chart(pdf).encode(
+                    y=alt.Y(
+                        "stat:N",
+                        sort=queries.PROFILE_STATS,
+                        title=None,
+                        axis=alt.Axis(
+                            domain=False, ticks=False, labelColor=ink,
+                            labelFontSize=11, labelPadding=8, labelLimit=200,
+                        ),
+                    ),
+                    yOffset=alt.YOffset("player:N", sort=order),
+                    x=alt.X(
+                        "pct:Q",
+                        title="Percentile among positional peers",
+                        scale=alt.Scale(domain=[0, 100]),
+                        axis=alt.Axis(**ax),
+                    ),
+                )
+                # An explicit bar height rather than a full offset band: the
+                # slack becomes the surface gap that separates one player's bar
+                # from the next, without drawing a border around either.
+                bars = base.mark_bar(cornerRadiusEnd=4, height=bar_h).encode(
+                    color=alt.Color(
+                        "player:N",
+                        title=None,
+                        scale=scale,
+                        sort=order,
+                        legend=alt.Legend(
+                            labelColor=ink, orient="top", symbolStrokeWidth=0, symbolType="square"
+                        ),
+                    ),
+                    tooltip=[
+                        alt.Tooltip("player:N", title="Player"),
+                        alt.Tooltip("stat:N", title="Metric"),
+                        alt.Tooltip("value:Q", title=f"Value{sfx}", format=".2f"),
+                        alt.Tooltip("pct:Q", title="Percentile", format=".0f"),
+                    ],
+                )
+                # Name the bars once, on the top group only. Identity then does
+                # not rest on colour alone, and 28 labels do not fight the axis.
+                names = (
+                    base.transform_filter(alt.datum.stat == queries.PROFILE_STATS[0])
+                    .mark_text(align="left", dx=6, fontSize=10, color=ink)
+                    .encode(text="player:N")
+                )
+                st.altair_chart(
+                    (bars + names)
+                    .properties(
+                        height=row_h * len(queries.PROFILE_STATS),
+                        padding={"right": 80, "top": 5},
+                    )
+                    .configure_view(strokeOpacity=0),
+                    width="stretch",
+                )
+                st.caption(
+                    f"Percentiles are against players in the same position with "
+                    f"{pool_min}+ minutes"
+                    + (", on a per-90 basis" if cmp_per90 else "")
+                    + ". ICT is omitted here — it is the sum of Influence, "
+                    "Creativity and Threat, so it would count the same "
+                    "performance a second time."
+                )
+
+            # --- the numbers ---------------------------------------------------
+            table = {"Metric": [], **{short[label]: [] for label in picked}}
+            if len(picked) == 2:
+                table["Δ"] = []
+            for stat, (column, scalable) in queries.COMPARE_STATS.items():
+                table["Metric"].append(stat + (" /90" if cmp_per90 and scalable else ""))
+                vals = [rows[label][f"v_{column}"] for label in picked]
+                for label, value in zip(picked, vals):
+                    table[short[label]].append(value)
+                if len(picked) == 2:
+                    both = vals[0] is not None and vals[1] is not None
+                    table["Δ"].append(vals[0] - vals[1] if both else None)
+
+            st.dataframe(
+                pl.DataFrame(table).with_columns(
+                    pl.col(pl.Float64).round(2)
+                ),
+                hide_index=True,
+                width="stretch",
+            )
+            if len(picked) == 2:
+                st.caption(f"Δ is {short[picked[0]]} minus {short[picked[1]]}.")
+
+
+with projection:
+    gw_options = _gameweeks()
+    if not gw_options:
+        st.info(
+            "No fixture list yet. The slow loop writes it on its first tick — "
+            "start the ingest daemon with `uv run flive-ingest`."
+        )
+    else:
+        st.caption(
+            "Expected points for fixtures not yet played, built from club "
+            "attack and defence ratings, the opponent, the venue and how much "
+            "of a match each player is likely to be on the pitch for. FPL "
+            "publishes a projection of its own; this one does not look at it, "
+            "so the two can be compared."
+        )
+
+        g1, g2, g3, g4 = st.columns([2.2, 2, 1.6, 1.6])
+        with g1:
+            gws = st.multiselect(
+                "Gameweeks",
+                gw_options,
+                default=gw_options[:1],
+                help=(
+                    "Pick several to project a run of fixtures. Totals sum "
+                    "every fixture a club has in the range, so a double "
+                    "gameweek counts twice and a blank counts as nothing."
+                ),
+            )
+        with g2:
+            pos_pick = st.multiselect(
+                "Position", ["GKP", "DEF", "MID", "FWD"], default=["GKP", "DEF", "MID", "FWD"]
+            )
+        with g3:
+            max_price = st.number_input("Max price £m", 3.5, 20.0, 20.0, step=0.5)
+        with g4:
+            min_mins = st.number_input(
+                "Min minutes played", 0, 3000, 90, step=90,
+                help="Season minutes so far. Every rate in the model divides by "
+                     "these, so a low bar lets in players whose numbers rest on "
+                     "a cameo.",
+            )
+
+        if not gws:
+            st.info("Pick at least one gameweek.")
+        else:
+            proj = _projections(tuple(sorted(gws)))
+            if proj.is_empty():
+                st.warning(
+                    "Nothing to project yet. Club attack and defence ratings "
+                    "are derived from matches already played, so there is "
+                    "nothing to build on until the season's first gameweek "
+                    "has finished."
+                )
+            else:
+                view = proj.filter(
+                    (pl.col("minutes") >= min_mins)
+                    & (pl.col("price") <= max_price)
+                    & (pl.col("xmins") > 0)
+                )
+                if pos_pick:
+                    view = view.filter(pl.col("position").is_in(pos_pick))
+
+                if view.is_empty():
+                    st.warning("No players match those filters.")
+                else:
+                    # One row per player per fixture, so a run of gameweeks —
+                    # and a double inside one — collapses by summing.
+                    part_cols = list(project.COMPONENTS)
+                    totals = (
+                        view.group_by("fpl_id")
+                        .agg(
+                            pl.col("web_name").first(),
+                            pl.col("team_name").first(),
+                            pl.col("position").first(),
+                            pl.col("price").first(),
+                            pl.col("minutes").first(),
+                            pl.col("xmins").mean().alias("xmins"),
+                            pl.col("p60").first(),
+                            pl.col("ep_next").first(),
+                            pl.col("selected_by_pct").first(),
+                            pl.col("news").first(),
+                            pl.len().alias("fixtures"),
+                            pl.col("difficulty").mean().alias("fdr"),
+                            pl.concat_str(
+                                [pl.col("opponent"), pl.col("venue")], separator=" ("
+                            ).add(")").str.join(", ").alias("opponents"),
+                            *[pl.col(c).sum() for c in part_cols],
+                            pl.col("xp").sum().alias("xp"),
+                        )
+                        .with_columns((pl.col("xp") / pl.col("price")).alias("xp_per_m"))
+                        .sort("xp", descending=True, nulls_last=True)
+                    )
+
+                    top_n = min(15, totals.height)
+                    top = totals.head(top_n)
+
+                    theme = _theme()
+                    ink = "#52514e" if theme == "light" else "#c3c2b7"
+                    ring = "#fcfcfb" if theme == "light" else "#1a1a19"
+
+                    # Long form for the stack: five segments per player.
+                    stacked = (
+                        top.select("web_name", *part_cols)
+                        .unpivot(index="web_name", variable_name="part", value_name="pts")
+                        .with_columns(
+                            pl.col("part")
+                            .replace_strict(STACK_OF, return_dtype=pl.Utf8)
+                            .alias("segment")
+                        )
+                        .group_by("web_name", "segment")
+                        .agg(pl.col("pts").sum())
+                        .filter(pl.col("pts").abs() > 0.005)
+                        # Vega orders a stack alphabetically unless told
+                        # otherwise, which would put Bonus before Defence and
+                        # leave the segments in a different order per bar.
+                        .with_columns(
+                            pl.col("segment")
+                            .replace_strict(
+                                {name: i for i, name in enumerate(STACK_ORDER)},
+                                return_dtype=pl.Int32,
+                            )
+                            .alias("rank")
+                        )
+                    )
+                    order = top["web_name"].to_list()
+                    colors = [STACK[theme][s] for s in STACK_ORDER]
+
+                    ax = dict(
+                        grid=True, gridOpacity=0.18, gridColor=ink, tickCount=6,
+                        domain=False, ticks=False, labelColor=ink, titleColor=ink,
+                        labelFontSize=11, titleFontSize=12, titlePadding=8,
+                    )
+                    bars = (
+                        alt.Chart(stacked.to_pandas())
+                        .mark_bar(cornerRadiusEnd=4, height=16, stroke=ring, strokeWidth=1)
+                        .encode(
+                            y=alt.Y(
+                                "web_name:N", sort=order, title=None,
+                                axis=alt.Axis(
+                                    domain=False, ticks=False, labelColor=ink,
+                                    labelFontSize=11, labelPadding=8, labelLimit=160,
+                                ),
+                            ),
+                            x=alt.X(
+                                "pts:Q",
+                                title="Expected points"
+                                + (f" over {len(gws)} gameweeks" if len(gws) > 1 else ""),
+                                axis=alt.Axis(**ax),
+                            ),
+                            color=alt.Color(
+                                "segment:N",
+                                title=None,
+                                scale=alt.Scale(domain=STACK_ORDER, range=colors),
+                                sort=STACK_ORDER,
+                                legend=alt.Legend(
+                                    labelColor=ink, orient="top",
+                                    symbolStrokeWidth=0, symbolType="square",
+                                ),
+                            ),
+                            order=alt.Order("rank:Q", sort="ascending"),
+                            tooltip=[
+                                alt.Tooltip("web_name:N", title="Player"),
+                                alt.Tooltip("segment:N", title="From"),
+                                alt.Tooltip("pts:Q", title="Points", format=".2f"),
+                            ],
+                        )
+                        .properties(
+                            # Floored: Vega drops every other axis label when
+                            # the plot is short, so a two-player result would
+                            # silently lose a name.
+                            height=max(120, 34 * top_n),
+                            padding={"right": 20, "top": 5},
+                        )
+                        .configure_view(strokeOpacity=0)
+                    )
+                    st.altair_chart(bars, width="stretch")
+                    st.caption(
+                        f"Top {top_n} by expected points. The deductions segment "
+                        "runs left of zero — goals conceded and cards are the "
+                        "only components that subtract."
+                    )
+
+                    flagged = totals.filter(pl.col("news").is_not_null()).head(6)
+                    if not flagged.is_empty():
+                        with st.expander(f"{flagged.height} of these carry an FPL news flag"):
+                            for r in flagged.iter_rows(named=True):
+                                st.caption(f"**{r['web_name']}** — {r['news']}")
+
+                    # FPL's own projection covers the next gameweek and nothing
+                    # further, so it only belongs beside xP when the horizon is
+                    # one gameweek too. Comparing it with a three-week total
+                    # would read as this model being wildly optimistic.
+                    single_gw = len(gws) == 1
+                    st.dataframe(
+                        totals.select(
+                            pl.col("web_name").alias("Player"),
+                            pl.col("team_name").alias("Team"),
+                            pl.col("position").alias("Pos"),
+                            pl.col("price").round(1).alias("£"),
+                            pl.col("opponents").alias("Fixtures"),
+                            pl.col("fdr").round(1).alias("FDR"),
+                            pl.col("xp").round(2).alias("xP"),
+                            pl.col("xp_per_m").round(2).alias("xP/£m"),
+                            *(
+                                [pl.col("ep_next").alias("FPL ep")]
+                                if single_gw
+                                else []
+                            ),
+                            pl.col("xmins").round(0).alias("xMins"),
+                            (pl.col("p60") * 100).round(0).alias("P(60) %"),
+                            pl.col("pts_appearance").round(2).alias("Appear"),
+                            pl.col("pts_goals").round(2).alias("Goals"),
+                            pl.col("pts_assists").round(2).alias("Assists"),
+                            pl.col("pts_clean_sheet").round(2).alias("CS"),
+                            pl.col("pts_defcon").round(2).alias("DefCon"),
+                            pl.col("pts_saves").round(2).alias("Saves"),
+                            pl.col("pts_bonus").round(2).alias("Bonus"),
+                            pl.col("pts_conceded").round(2).alias("Conceded"),
+                            pl.col("pts_cards").round(2).alias("Cards"),
+                            pl.col("selected_by_pct").alias("Owned %"),
+                        ).head(200),
+                        hide_index=True,
+                        width="stretch",
+                    )
+                    st.caption(
+                        "**xP** is this model"
+                        + (
+                            "; **FPL ep** is FPL's own figure, shown as a "
+                            "cross-check rather than an input"
+                            if single_gw
+                            else ", summed over every fixture in range"
+                        )
+                        + ". **FDR** is FPL's fixture difficulty, 1 easiest to "
+                        "5, averaged over those fixtures — displayed only, never "
+                        "used in the arithmetic, since the model derives its own "
+                        "club ratings. **xMins** is per match."
+                    )
+
+                    with st.expander("Club ratings behind these numbers"):
+                        strength = _strength()
+                        if strength.is_empty():
+                            st.caption("Not enough finished fixtures yet.")
+                        else:
+                            st.caption(
+                                "Attack and defence are league-relative: 1.00 is "
+                                "average, higher attack is better, higher defence "
+                                "is leakier. Both are shrunk toward 1.00 by how "
+                                "few matches they rest on, which is why they "
+                                "cluster early in a season."
+                            )
+                            st.dataframe(
+                                strength.select(
+                                    pl.col("team_name").alias("Team"),
+                                    pl.col("matches").alias("Played"),
+                                    pl.col("xg_pm").round(2).alias("xG / match"),
+                                    pl.col("xgc_pm").round(2).alias("xGC / match"),
+                                    pl.col("attack").round(3).alias("Attack"),
+                                    pl.col("defence").round(3).alias("Defence"),
+                                ),
+                                hide_index=True,
+                                width="stretch",
+                            )
+
+
 with fantasy:
 
     @st.fragment(run_every=REFRESH * 2)
     def fantasy_panel() -> None:
         board = _fantasy(window)
         if board.is_empty():
+            # This board is live gameweek scoring, so unlike the Matches tab
+            # there is no standing-in for it — season totals are a different
+            # question and the Players tab already answers it. Say when it
+            # will fill and point at what does work now.
             st.info(
-                "No gameweek data yet. The live loop populates this once a "
-                "gameweek is active."
+                "This board shows live gameweek scoring, so it fills once a "
+                "gameweek is under way. " + _kickoff_note()
+            )
+            st.caption(
+                "In the meantime: **Players** has season totals, **Projection** "
+                "has expected points for the fixtures ahead."
             )
             return
 

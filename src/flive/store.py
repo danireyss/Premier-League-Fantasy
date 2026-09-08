@@ -129,6 +129,79 @@ SCHEMAS: dict[str, dict[str, pl.DataType]] = {
         "points_per_game": pl.Float64,
         "value_season": pl.Float64,
         "ep_next": pl.Float64,
+        # --- the projection's inputs -------------------------------------
+        # Everything below feeds project.py. Season counting stats first:
+        # every scoring event FPL pays or docks points for, so a projection
+        # can be built from rates rather than from points-per-game, which
+        # tells you what happened but not what drove it.
+        "clean_sheets": pl.Int32,
+        "goals_conceded": pl.Int32,
+        "own_goals": pl.Int32,
+        "saves": pl.Int32,
+        "yellow_cards": pl.Int32,
+        "red_cards": pl.Int32,
+        "penalties_saved": pl.Int32,
+        "penalties_missed": pl.Int32,
+        # Rates FPL publishes directly. xgc_per_90 is the team's expected
+        # goals conceded while this player was on the pitch, which is the
+        # cleanest defensive read the API offers.
+        "xgc_per_90": pl.Float64,
+        "saves_per_90": pl.Float64,
+        "goals_conceded_per_90": pl.Float64,
+        "starts_per_90": pl.Float64,
+        "clean_sheets_per_90": pl.Float64,
+        "defensive_contribution_per_90": pl.Float64,
+        # Set-piece and availability context. penalties_order is 1 for a
+        # club's first-choice taker and null for everyone else.
+        "penalties_order": pl.Int32,
+        "corners_order": pl.Int32,
+        "freekicks_order": pl.Int32,
+        "news": pl.Utf8,
+        "ep_this": pl.Float64,
+    },
+    # The schedule, not the live state — every fixture of the season including
+    # ones not yet played. fixture_snapshots is a time series of matches in
+    # progress; this is the fixture list, rewritten by the slow loop, and it is
+    # what a projection needs: who a team plays next, where, and how hard FPL
+    # rates it.
+    "fixtures": {
+        "captured_at": TS,
+        "fixture_id": pl.Int32,
+        "gw": pl.Int32,
+        "kickoff_time": TS,
+        "home_team_id": pl.Int32,
+        "away_team_id": pl.Int32,
+        "home_name": pl.Utf8,
+        "away_name": pl.Utf8,
+        # FPL's own fixture difficulty rating, 1 (easiest) to 5, set per side
+        # and already venue-aware — the home and away figures differ.
+        "home_difficulty": pl.Int32,
+        "away_difficulty": pl.Int32,
+        # Null until the match is played. Carried here so the app has something
+        # to show between gameweeks: the live tables are written only while a
+        # match is in progress, so for the four days between one gameweek and
+        # the next they are empty and the schedule is all there is.
+        "home_score": pl.Int32,
+        "away_score": pl.Int32,
+        "started": pl.Boolean,
+        "finished": pl.Boolean,
+    },
+    # Club-level metadata. FPL leaves the attack/defence strength fields at 0
+    # for most of a season and never populates played/won/lost at all, so the
+    # projection derives its own ratings from player data and keeps these only
+    # for reference.
+    "fpl_teams": {
+        "captured_at": TS,
+        "team_id": pl.Int32,
+        "name": pl.Utf8,
+        "short_name": pl.Utf8,
+        "strength": pl.Int32,
+        "strength_overall_home": pl.Int32,
+        "strength_overall_away": pl.Int32,
+        "strength_attack_home": pl.Int32,
+        "strength_attack_away": pl.Int32,
+        "strength_defence_home": pl.Int32,
+        "strength_defence_away": pl.Int32,
     },
 }
 
@@ -165,13 +238,24 @@ def write(table: str, df: pl.DataFrame) -> Path | None:
 
 
 def scan(table: str) -> pl.LazyFrame:
-    """Lazy scan across every partition. Returns an empty frame if none exist."""
+    """Lazy scan across every partition. Returns an empty frame if none exist.
+
+    Adding a column to a schema has to stay non-breaking: files written before
+    the change do not carry it, and the default scan raises on that mismatch
+    rather than reading the older parts. `missing_columns="insert"` fills them
+    with nulls, `extra_columns="ignore"` covers a column that has since been
+    dropped, and the trailing select pins the column order to the schema.
+    """
     root = DATA_DIR / table
     if not root.exists() or not any(root.rglob("*.parquet")):
         return empty(table).lazy()
-    return pl.scan_parquet(root / "**/*.parquet", hive_partitioning=True).select(
-        list(SCHEMAS[table].keys())
-    )
+    return pl.scan_parquet(
+        root / "**/*.parquet",
+        hive_partitioning=True,
+        schema=SCHEMAS[table],
+        missing_columns="insert",
+        extra_columns="ignore",
+    ).select(list(SCHEMAS[table]))
 
 
 class Buffer:

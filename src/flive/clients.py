@@ -61,6 +61,14 @@ class FPL:
         """Kickoff, match minute, score and finished flags for one gameweek."""
         return await self._get("/fixtures/", event=gw)
 
+    async def schedule(self) -> list:
+        """Every fixture of the season, played and unplayed, with difficulty.
+
+        Unfiltered — `?future=1` returns only what is left, and the projection
+        needs the played ones too to work out how many matches a club has had.
+        """
+        return await self._get("/fixtures/")
+
     async def event_status(self) -> dict:
         """Tells you whether bonus points have settled."""
         return await self._get("/event-status/")

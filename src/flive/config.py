@@ -64,3 +64,50 @@ INT_STATS = {
     "defensive_contribution": "defensive_contribution",
     "starts": "starts",
 }
+
+
+# --- Projection model --------------------------------------------------------
+# FPL's 2025/26 scoring. Points per goal and per clean sheet depend on position;
+# everything else is flat.
+GOAL_POINTS = {"GKP": 6, "DEF": 6, "MID": 5, "FWD": 4}
+CLEAN_SHEET_POINTS = {"GKP": 4, "DEF": 4, "MID": 1, "FWD": 0}
+ASSIST_POINTS = 3
+SAVES_PER_POINT = 3  # a goalkeeper scores 1 point per 3 saves
+CONCEDED_PER_MINUS = 2  # GKP and DEF lose 1 point per 2 goals conceded
+DEFCON_POINTS = 2
+# Defensive contributions needed in a match to earn those 2 points. Defenders
+# count clearances, blocks, interceptions and tackles; everyone else also
+# counts ball recoveries, and needs two more of them.
+DEFCON_THRESHOLD = {"DEF": 10, "MID": 12, "FWD": 12}
+
+# Home advantage, applied to the attacking side's expected goals. The Premier
+# League's long-run home scoring edge is roughly ten percent either way. FPL's
+# own difficulty rating is already venue-aware, so this is deliberately the
+# only place venue is modelled — applying both would count it twice.
+HOME_ATTACK = 1.10
+AWAY_ATTACK = 0.90
+
+# Club attack and defence ratings are league-relative and derived from a handful
+# of matches early on, where one thrashing swings a rating wildly. Shrink each
+# toward the league average as though the club had also played PRIOR_MATCHES
+# average games. At 3 played and 5 prior, a rating keeps 3/8 of its observed
+# distance from average — heavy, and correct, at that sample size.
+PRIOR_MATCHES = 5.0
+
+# Minutes model. A named starter almost always reaches the 60 minutes that pay
+# the second appearance point, but not quite always — substitutions, injuries
+# and red cards take a share. And a player averaging a full BENCH_CERTAIN
+# minutes per match is treated as certain to get on the pitch at all.
+START_REACHES_60 = 0.88
+BENCH_CERTAIN = 20.0
+
+# FPL's availability flags. 'a' is fit; the rest are degrees of doubt, and
+# chance_of_playing_next_round overrides these whenever FPL publishes one.
+STATUS_AVAILABILITY = {
+    "a": 1.0,   # available
+    "d": 0.75,  # doubtful
+    "i": 0.0,   # injured
+    "s": 0.0,   # suspended
+    "u": 0.0,   # unavailable
+    "n": 0.0,   # not in the squad
+}

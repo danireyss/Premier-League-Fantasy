@@ -97,9 +97,23 @@ async def slow_loop(fpl: FPL) -> None:
         try:
             bootstrap = await fpl.bootstrap()
             _refresh_meta(bootstrap)
-            rows = parse.fpl_player_rows(bootstrap, store.now())
+            captured_at = store.now()
+
+            rows = parse.fpl_player_rows(bootstrap, captured_at)
             store.write("fpl_players", store.conform("fpl_players", rows))
-            log.info("bootstrap: %d players, %d teams", len(rows), len(_team_names))
+            teams = parse.fpl_team_rows(bootstrap, captured_at)
+            store.write("fpl_teams", store.conform("fpl_teams", teams))
+
+            # The whole season's fixture list, not just this gameweek's. The
+            # projection needs the unplayed ones to know who a club faces next
+            # and the played ones to know how many matches its rates rest on.
+            schedule = parse.schedule_rows(await fpl.schedule(), _team_names, captured_at)
+            store.write("fixtures", store.conform("fixtures", schedule))
+
+            log.info(
+                "bootstrap: %d players, %d teams, %d fixtures",
+                len(rows), len(teams), len(schedule),
+            )
         except Exception:
             log.exception("bootstrap failed")
         await _sleep_or_stop(SLOW_INTERVAL)

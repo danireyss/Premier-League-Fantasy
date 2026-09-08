@@ -4,17 +4,41 @@ services:
     command: uv run flive-ingest
     environment:
       FLIVE_DATA_DIR: /app/data
+      # The host's bytecode is built by a different Python than the image's.
+      # The cache files are version-tagged so they cannot collide, but writing
+      # them into a mounted tree only litters the working copy.
+      PYTHONDONTWRITEBYTECODE: "1"
     volumes:
       - ./data:/app/data
+      # Source is mounted, not just baked in at build time, so the containers
+      # track the working tree. Without this the image holds a copy from
+      # whenever it was last built, and old code reading newly written data is
+      # exactly how a schema change surfaces as a SchemaError at runtime.
+      # The venv at /app/.venv is left alone: only these two paths are
+      # overlaid, and flive is installed into it editable against /app/src.
+      - ./src:/app/src
+      - ./app.py:/app/app.py
     restart: unless-stopped
 
   app:
     build: .
-    command: uv run streamlit run app.py --server.address=0.0.0.0
+    # runOnSave reruns the script when a source file changes, and the watcher
+    # has to poll to see it: a bind mount from the host does not deliver
+    # inotify events into the container, so the default "auto" watcher sits
+    # silent and the app serves stale code from a mount that is perfectly
+    # up to date. Polling costs a stat every couple of seconds.
+    command: >
+      uv run streamlit run app.py
+      --server.address=0.0.0.0
+      --server.runOnSave=true
+      --server.fileWatcherType=poll
     environment:
       FLIVE_DATA_DIR: /app/data
+      PYTHONDONTWRITEBYTECODE: "1"
     volumes:
       - ./data:/app/data
+      - ./src:/app/src
+      - ./app.py:/app/app.py
     ports:
       - "8501:8501"
     depends_on:
