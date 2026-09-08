@@ -71,7 +71,7 @@ def _name_match(term: str) -> pl.Expr:
 
 
 def _excluded_note(named: pl.DataFrame, min_mins: int, max_price: float,
-                   pos_pick: list[str]) -> str:
+                   pos_pick: list[str], team_pick: list[str]) -> str:
     """Why the players a search found were then filtered away.
 
     Worth spelling out: the default 90-minute bar hides every squad player who
@@ -86,6 +86,8 @@ def _excluded_note(named: pl.DataFrame, min_mins: int, max_price: float,
             why = f"£{r['price']:.1f}m, over the £{max_price:.1f}m cap"
         elif pos_pick and r["position"] not in pos_pick:
             why = f"a {r['position']}, not in the position filter"
+        elif team_pick and r["team_name"] not in team_pick:
+            why = f"at {r['team_name']}, not in the team filter"
         else:
             why = "not expected on the pitch for these fixtures"
         reasons.append(f"**{r['web_name']}** ({r['team_name']}) — {why}")
@@ -773,7 +775,7 @@ with projection:
             "so the two can be compared."
         )
 
-        g1, g2, g3, g4, g5 = st.columns([2.2, 1.8, 1.4, 1.4, 1.8])
+        g1, g2, g3 = st.columns([2.2, 2, 2.4])
         with g1:
             gws = st.multiselect(
                 "Gameweeks",
@@ -790,15 +792,24 @@ with projection:
                 "Position", ["GKP", "DEF", "MID", "FWD"], default=["GKP", "DEF", "MID", "FWD"]
             )
         with g3:
-            max_price = st.number_input("Max price £m", 3.5, 20.0, 20.0, step=0.5)
+            team_pick = st.multiselect(
+                "Team",
+                sorted(_players()["team_name"].drop_nulls().unique().to_list()),
+                key="proj_teams",
+                help="Empty means every club.",
+            )
+
+        g4, g5, g6 = st.columns([2.2, 2, 2.4])
         with g4:
+            max_price = st.number_input("Max price £m", 3.5, 20.0, 20.0, step=0.5)
+        with g5:
             min_mins = st.number_input(
                 "Min minutes played", 0, 3000, 90, step=90,
                 help="Season minutes so far. Every rate in the model divides by "
                      "these, so a low bar lets in players whose numbers rest on "
                      "a cameo.",
             )
-        with g5:
+        with g6:
             name_search = st.text_input(
                 "Search player", placeholder="surname…", key="proj_search"
             )
@@ -827,10 +838,14 @@ with projection:
                 )
                 if pos_pick:
                     view = view.filter(pl.col("position").is_in(pos_pick))
+                if team_pick:
+                    view = view.filter(pl.col("team_name").is_in(team_pick))
 
                 if view.is_empty():
                     if name_search and not named.is_empty():
-                        st.warning(_excluded_note(named, min_mins, max_price, pos_pick))
+                        st.warning(
+                            _excluded_note(named, min_mins, max_price, pos_pick, team_pick)
+                        )
                     elif name_search:
                         st.warning(f"No player's name contains “{name_search.strip()}”.")
                     else:
