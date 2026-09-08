@@ -1,0 +1,8 @@
+.git
+.gitignore
+data/
+*.zip
+__pycache__/
+*.pyc
+.venv/
+.env

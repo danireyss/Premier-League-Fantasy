@@ -1,0 +1,22 @@
+services:
+  ingest:
+    build: .
+    command: uv run flive-ingest
+    environment:
+      FLIVE_DATA_DIR: /app/data
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+
+  app:
+    build: .
+    command: uv run streamlit run app.py --server.address=0.0.0.0
+    environment:
+      FLIVE_DATA_DIR: /app/data
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "8501:8501"
+    depends_on:
+      - ingest
+    restart: unless-stopped
