@@ -233,6 +233,10 @@ COMPARE_STATS: dict[str, tuple[str, bool]] = {
     "ICT": ("ict_index", True),
     "BPS": ("bps", True),
     "Defensive contribution": ("defensive_contribution", True),
+    "Tackles": ("tackles", True),
+    "Recoveries": ("recoveries", True),
+    "Clearances, blocks & int.": ("cbi", True),
+    "Clean sheets": ("clean_sheets", True),
     "Points per game": ("points_per_game", False),
     "Owned %": ("selected_by_pct", False),
 }
@@ -249,6 +253,124 @@ PROFILE_STATS = [
     "BPS",
     "Defensive contribution",
 ]
+
+# The midfield profile: label -> which side of a midfielder's job it measures.
+# Dict order is the order the matrix draws, creation first.
+#
+# Four of the metrics a midfield profile wants do not exist in this API and are
+# not approximated here: touches, pass accuracy, accurate long balls and duels
+# won. FPL publishes no pass, touch or duel counter of any kind, so there is
+# nothing honest to put in their place -- see `player_board` on key passes.
+# Creativity is Opta's chance-creation index and stands in for key passes and
+# big chances created; interceptions arrive only inside `cbi`, bundled with
+# clearances and blocks, and FPL never separates them.
+#
+# `defensive_contribution` is deliberately absent: for a midfielder it is the
+# sum of the three ball-winning rows below it, so giving it a row of its own
+# would count the same tackle twice -- the reason ICT is left out of
+# PROFILE_STATS above.
+MIDFIELD_PROFILE: dict[str, str] = {
+    "xA": "Creation",
+    "Creativity": "Creation",
+    "Tackles": "Ball-winning",
+    "Clearances, blocks & int.": "Ball-winning",
+    "Recoveries": "Ball-winning",
+}
+# The defender profile. Same split into two sides, but note which way round
+# the weight sits: defending is the job and attacking output is the bonus.
+#
+# Six of the thirteen stats a defender profile wants are not in this API and
+# are not faked here: accurate passes, pass accuracy, accurate long balls,
+# aerial duels won and ground duels won have no counter of any kind, and there
+# is no shot counter either, so shots on target has none. Threat is Opta's
+# shooting-threat index and stands in for it; creativity and xA stand in for
+# key passes, as they do in the midfield profile.
+#
+# Interceptions, clearances and blocked shots are three separate asks that FPL
+# publishes only as one summed `cbi` column, so they arrive here as one row and
+# cannot be pulled apart.
+#
+# Clean sheets is a team outcome wearing a player's name: a defender in a
+# well-drilled side collects them whatever he personally does, so it ranks the
+# team as much as the man. It is on the chart because it is a real part of how
+# a defender is judged, and called out in the caption because it is not his
+# own work the way a tackle is.
+DEFENDER_PROFILE: dict[str, str] = {
+    "Tackles": "Defending",
+    "Clearances, blocks & int.": "Defending",
+    "Recoveries": "Defending",
+    "Clean sheets": "Defending",
+    "xA": "Attacking",
+    "Creativity": "Attacking",
+    "Threat": "Attacking",
+}
+POSITION_PROFILES: dict[str, dict[str, str]] = {
+    "MID": MIDFIELD_PROFILE,
+    "DEF": DEFENDER_PROFILE,
+}
+
+
+def profile_sides(position: str) -> list[str]:
+    """The sides a position's profile splits into, in the order it draws them."""
+    return list(dict.fromkeys(POSITION_PROFILES[position].values()))
+
+
+def position_scores(
+    position: str, min_minutes: int = 90, per_90: bool = False
+) -> pl.DataFrame:
+    """Each player's two side scores and their mean, keyed by `fpl_id`.
+
+    Each side of the position's profile is averaged first and the two side means
+    are then averaged together, so each side carries one vote. A flat mean of
+    the metrics would not: the sides hold different numbers of them, and the
+    ones on a side largely count the same work, so a flat mean would weight a
+    side by how many columns it happens to own rather than by how much it
+    matters. `flat` carries that reading anyway, since it is the other
+    defensible one.
+
+    Only players holding the complete profile are scored. Percentiles arrive
+    all-or-nothing -- a player short of the pool threshold has every one of them
+    null -- but averaging whatever happens to be present would flatter a partial
+    profile, so the count is checked rather than assumed.
+
+    A caller wanting a single "best all-rounder" ranking out of this should
+    think about whether the position's two sides really are equally the job.
+    For a midfielder they are. For a defender they are not: attacking output is
+    a bonus, and FPL calls every defender "DEF", so a centre-back who never
+    leaves his box and an overlapping full-back are ranked against each other
+    on a side only one of them is asked to play.
+    """
+    profile = POSITION_PROFILES[position]
+    sides = profile_sides(position)
+    board = compare_board(min_minutes, per_90)
+    by_side: dict[str, list[str]] = {}
+    for stat, side in profile.items():
+        by_side.setdefault(side, []).append(f"p_{COMPARE_STATS[stat][0]}")
+    every = [c for cols in by_side.values() for c in cols]
+
+    if board.is_empty() or any(c not in board.columns for c in every):
+        return pl.DataFrame(
+            schema={
+                "fpl_id": pl.Int32,
+                **{side: pl.Float64 for side in sides},
+                "flat": pl.Float64,
+                "score": pl.Float64,
+            }
+        )
+
+    return (
+        board.filter(pl.col("position") == position)
+        .select(
+            "fpl_id",
+            *[pl.mean_horizontal(cols).alias(side) for side, cols in by_side.items()],
+            pl.mean_horizontal(every).alias("flat"),
+            pl.sum_horizontal(pl.col(c).is_not_null() for c in every).alias("_held"),
+        )
+        .filter(pl.col("_held") == len(profile))
+        .drop("_held")
+        .with_columns(pl.mean_horizontal(sides).alias("score"))
+        .sort("score", descending=True, nulls_last=True)
+    )
 
 
 def compare_board(min_minutes: int = 90, per_90: bool = False) -> pl.DataFrame:

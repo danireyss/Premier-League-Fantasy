@@ -51,9 +51,30 @@ def _players() -> pl.DataFrame:
     return queries.player_board()
 
 
+# Both boards below are shaped by queries.COMPARE_STATS and POSITION_PROFILES,
+# and Streamlit keys a cache entry on the wrapper's own source and arguments —
+# never on a module constant the wrapper happens to read. Adding a metric
+# therefore changed the board's columns without changing anything the cache
+# could see, and a board cached under the previous metric set was handed back
+# to a profile that then asked it for a percentile column it had never been
+# built with. Passing the metric set in as an argument is what makes that
+# dependency visible to the cache.
+METRIC_KEY = ",".join(queries.COMPARE_STATS) + "|" + ",".join(
+    f"{pos}:{','.join(profile)}"
+    for pos, profile in sorted(queries.POSITION_PROFILES.items())
+)
+
+
 @st.cache_data(ttl=300, show_spinner=False)
-def _compare(min_minutes: int, per_90: bool) -> pl.DataFrame:
+def _compare(min_minutes: int, per_90: bool, metrics: str = METRIC_KEY) -> pl.DataFrame:
     return queries.compare_board(min_minutes, per_90)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _pos_scores(
+    position: str, min_minutes: int, per_90: bool, metrics: str = METRIC_KEY
+) -> pl.DataFrame:
+    return queries.position_scores(position, min_minutes, per_90)
 
 
 def _name_match(term: str) -> pl.Expr:
@@ -149,6 +170,34 @@ PALETTE = {
 }
 OUTFIELD = ["DEF", "MID", "FWD"]
 
+# The midfield matrix. A percentile is a position either side of the median
+# midfielder, so the scale is diverging rather than sequential: neutral at the
+# 50th, both poles saturating outward. Blue-red is the documented diverging
+# pair — the two poles read as opposite and the grey midpoint reads as nothing
+# to see, which blue-aqua does not.
+#
+# Each arm has to hold one hue, which is what decides the stops. Light blends
+# toward near-white, and that holds hue on its own, so three stops is the whole
+# ramp. Dark cannot: its midpoint is near-black, and running a bright pole
+# straight into it desaturates and darkens at the same time — rendered, the
+# blue arm came out teal and the red arm brown, both arms reading as a hue
+# nobody put there. Each dark arm therefore gets an explicit on-hue step, so
+# only lightness moves along it and the hue stays at 0° and 213°.
+DIVERGING = {
+    "light": ([0, 50, 100], ["#e34948", "#f0efec", "#2a78d6"]),
+    "dark": (
+        [0, 25, 50, 75, 100],
+        ["#e66767", "#9c4242", "#383835", "#1c5cab", "#3987e5"],
+    ),
+}
+# Where the in-cell number stops being legible against the cell under it. Every
+# stop on the light ramp holds at least 4.46:1 against primary ink, so light
+# keeps one colour throughout. Dark has to flip at both poles, where the cell
+# is at full brightness: white across the middle, dark ink at the ends.
+DARK_INK_FLIP = (12, 92)
+MATRIX_ROWS = 12
+RANK_ROWS = 15
+
 # Slots 1-4. Grouped bars are read against their neighbours, so the adjacent
 # pairlist applies and the fourth slot is available here even though the scatter
 # above has to stop at three.
@@ -188,6 +237,10 @@ STACK_OF = {
     "pts_cards": "Deductions",
 }
 STACK_ORDER = ["Appearance", "Attack", "Defence", "Bonus", "Deductions"]
+# What the projection can be ranked by, and the column in the per-player totals
+# each one sorts on. Attack and defence are stack segments summed back up.
+STACK_RANKS = ["Total", "Attack", "Defence"]
+RANK_COL = {"Total": "xp", "Attack": "pts_attack", "Defence": "pts_defence"}
 
 
 def _theme() -> str:
@@ -223,6 +276,408 @@ def _labels(df: pl.DataFrame, n: int = 6) -> pl.DataFrame:
         if clear:
             kept.append(row)
     return pl.DataFrame(kept, schema=ranked.schema) if kept else ranked.head(0)
+
+
+# What each position's profile is called on screen, and the notes that belong
+# under it. The absences are stated on the chart rather than left for a reader
+# to assume a proxy is the real thing.
+PROFILE_LABEL = {"MID": "midfielder", "DEF": "defender"}
+PROFILE_NOTE = {
+    "MID": (
+        "**Creativity** is Opta's chance-creation index, the closest thing here "
+        "to key passes and big chances created; interceptions are inside "
+        "**clearances, blocks & int.**, which FPL never splits. Touches, pass "
+        "accuracy, long balls and duels won are absent from the FPL API "
+        "entirely, so they are not on this chart — nothing published here would "
+        "stand in for them honestly."
+    ),
+    "DEF": (
+        "**Clearances, blocks & int.** is one column because FPL sums those "
+        "three and never splits them. **Creativity** and **xA** stand in for key "
+        "passes, **threat** for shots on target — FPL counts no passes and no "
+        "shots. **Clean sheets** is a team outcome as much as a personal one: a "
+        "defender in a well-drilled side collects them whatever he does. "
+        "Accurate passes, pass accuracy, long balls, and aerial and ground "
+        "duels are absent from the API entirely."
+    ),
+}
+
+
+def _profile_section(
+    position: str,
+    view: pl.DataFrame,
+    min_minutes: int,
+    per90: bool,
+    sfx: str,
+    rank: bool,
+) -> None:
+    """Draw one position's percentile profile: the matrix, and optionally the
+    all-round ranking above it.
+
+    The ranking is orderable by either side as well as by the all-round mean,
+    which is what makes it safe for defenders. A defender's all-round score
+    rates attacking output as half the job when it is really a bonus, and FPL
+    labels every defender "DEF", so the all-round order alone puts overlapping
+    full-backs above stay-at-home centre-backs every time. Ranking on
+    "Defending" asks the question a centre-back can actually win. The dumbbell
+    keeps both sides visible whichever order is chosen, so the trade is never
+    hidden.
+    """
+    profile = queries.POSITION_PROFILES[position]
+    sides = queries.profile_sides(position)
+    noun = PROFILE_LABEL[position]
+
+    pool = view.filter(pl.col("position") == position)
+    if pool.is_empty():
+        return
+
+    # Two players can share a web_name, and both charts key rows by the label —
+    # an undisambiguated pair would silently collapse into one row of somebody
+    # else's numbers. Resolved across the whole position, not per chart, so a
+    # player keeps the same label in both.
+    labelled = pool.with_columns(
+        pl.when(pl.col("web_name").is_duplicated())
+        .then(pl.col("web_name") + pl.lit(" · ") + pl.col("team_name"))
+        .otherwise(pl.col("web_name"))
+        .alias("label")
+    )
+    cols = {stat: queries.COMPARE_STATS[stat][0] for stat in profile}
+    # Percentiles come from the compare board, which ranks within position: 5
+    # tackles means nothing next to a centre-back's and everything next to
+    # another midfielder's. The pool is every player at the position clearing
+    # the minutes filter, deliberately not the ones left after team and search —
+    # filtering to one club would rank its players against each other and call
+    # the best of them elite.
+    board = _compare(min_minutes, per90, METRIC_KEY)
+    # Belt as well as braces on the cache key above: whatever the reason a board
+    # arrives without a metric's percentile column, say so and draw nothing
+    # rather than dying inside a select and taking the whole page with it.
+    wanted = [f"{p}_{c}" for c in cols.values() for p in ("p", "v")]
+    missing = [c for c in wanted if c not in board.columns]
+    if missing:
+        st.caption(
+            f"The {PROFILE_LABEL[position]} profile is a metric behind the "
+            "board it reads from. Clear the cache — press **C**, or *Clear "
+            "cache* in the ⋮ menu — and it will rebuild."
+        )
+        return
+    ranked = board.select("fpl_id", *wanted)
+    grid = labelled.select("fpl_id", "label", "total_points").join(
+        ranked, on="fpl_id", how="left"
+    )
+
+    cells_all = pl.DataFrame(
+        [
+            {
+                "player": r["label"],
+                "stat": stat,
+                "side": side,
+                "pct": r[f"p_{cols[stat]}"],
+                "value": r[f"v_{cols[stat]}"],
+            }
+            for r in grid.iter_rows(named=True)
+            for stat, side in profile.items()
+        ],
+        schema={
+            "player": pl.Utf8, "stat": pl.Utf8, "side": pl.Utf8,
+            "pct": pl.Float64, "value": pl.Float64,
+        },
+    ).drop_nulls("pct")
+
+    st.markdown(f"**{noun.capitalize()} profile**")
+    if cells_all.is_empty():
+        st.caption(
+            f"No {noun} here clears the minutes filter, so there is no peer "
+            "pool to rank against. Lower it to fill this in."
+        )
+        return
+
+    theme = _theme()
+    ink = "#52514e" if theme == "light" else "#c3c2b7"
+    surface = "#fcfcfb" if theme == "light" else "#1a1a19"
+    ramp_domain, ramp = DIVERGING[theme]
+
+    complete = (
+        labelled.select("fpl_id", "label")
+        .join(
+            _pos_scores(position, min_minutes, per90, METRIC_KEY),
+            on="fpl_id",
+            how="inner",
+        )
+        .rename({"label": "player"})
+    )
+
+    rank_by = "All-round"
+    if rank and not complete.is_empty():
+        # Ranking on one side rather than the mean is how a defender board
+        # stays honest. FPL calls every defender "DEF", so a single all-round
+        # number ranks a centre-back who never leaves his box against an
+        # overlapping full-back on a side only one of them is asked to play —
+        # and the full-back wins it every time. Picking a side asks the
+        # question that actually has an answer. It earns its place for
+        # midfielders too: best ball-winner is not best creator.
+        rank_by = st.radio(
+            "Rank by",
+            ["All-round", *sides],
+            horizontal=True,
+            key=f"rank_by_{position}",
+            help=(
+                "All-round is the mean of both sides. Pick a side to rank on "
+                "that alone — the two are different questions, and for "
+                f"{noun}s they can give very different answers."
+            ),
+        )
+    rank_col = "score" if rank_by == "All-round" else rank_by
+    complete = complete.sort(rank_col, descending=True, nulls_last=True)
+
+    if rank and not complete.is_empty():
+        _profile_ranking(
+            complete, sides, rank_col, rank_by, theme, ink, surface, noun
+        )
+
+    row_order = "Points"
+    if rank and not complete.is_empty():
+        row_order = st.radio(
+            "Matrix rows",
+            ["Points", "Ranking order"],
+            horizontal=True,
+            key=f"matrix_order_{position}",
+            help=(
+                "Which players the matrix below draws, and in what order. The "
+                "chart above always ranks on the all-round score."
+            ),
+        )
+    if row_order == "Ranking order":
+        picked_rows = complete["player"].to_list()[:MATRIX_ROWS]
+    else:
+        picked_rows = labelled.sort(
+            "total_points", descending=True, nulls_last=True
+        )["label"].to_list()[:MATRIX_ROWS]
+
+    cells = cells_all.filter(pl.col("player").is_in(picked_rows))
+    order = [r for r in picked_rows if r in set(cells["player"])]
+    if not order:
+        st.caption(f"No {noun} here holds a full profile to draw.")
+        return
+
+    cdf = cells.to_pandas()
+    base = alt.Chart(cdf).encode(
+        x=alt.X(
+            "stat:N",
+            sort=list(profile),
+            title=None,
+            axis=alt.Axis(
+                orient="top", domain=False, ticks=False, labelColor=ink,
+                labelFontSize=11, labelAngle=0, labelPadding=6, labelLimit=180,
+            ),
+        ),
+        y=alt.Y(
+            "player:N",
+            sort=order,
+            title=None,
+            axis=alt.Axis(
+                domain=False, ticks=False, labelColor=ink,
+                labelFontSize=11, labelPadding=8, labelLimit=160,
+            ),
+        ),
+    )
+    # The 2px surface stroke is the gap between cells, not a border: drawn in
+    # the surface colour it separates without adding a line to read.
+    heat = base.mark_rect(
+        cornerRadius=3, stroke=surface, strokeWidth=2
+    ).encode(
+        color=alt.Color(
+            "pct:Q",
+            title=f"Percentile among {noun}s",
+            # Interpolate in RGB explicitly. Vega defaults a continuous colour
+            # scale to HCL, and the midpoint here is a near-neutral whose hue is
+            # arbitrary — HCL swept from it round to blue through green and
+            # clamped out of gamut on the way, so the 60-70 band rendered teal
+            # however the stops were chosen.
+            scale=alt.Scale(
+                domain=ramp_domain, range=ramp, interpolate="rgb", clamp=True
+            ),
+            legend=alt.Legend(
+                orient="bottom", direction="horizontal",
+                gradientLength=200, gradientThickness=10,
+                labelColor=ink, titleColor=ink,
+                labelFontSize=11, titleFontSize=12,
+            ),
+        ),
+        tooltip=[
+            alt.Tooltip("player:N", title="Player"),
+            alt.Tooltip("stat:N", title="Metric"),
+            alt.Tooltip("value:Q", title=f"Value{sfx}", format=".2f"),
+            alt.Tooltip("pct:Q", title="Percentile", format=".0f"),
+        ],
+    )
+    nums = base.mark_text(fontSize=11).encode(
+        text=alt.Text("pct:Q", format=".0f"),
+        color=(
+            alt.value("#0b0b0b")
+            if theme == "light"
+            else alt.condition(
+                f"datum.pct < {DARK_INK_FLIP[0]} || datum.pct > {DARK_INK_FLIP[1]}",
+                alt.value("#0b0b0b"),
+                alt.value("#ffffff"),
+            )
+        ),
+    )
+    st.altair_chart(
+        alt.layer(heat, nums)
+        .properties(width=alt.Step(104), height=alt.Step(34))
+        .facet(
+            column=alt.Column(
+                "side:N",
+                sort=sides,
+                title=None,
+                header=alt.Header(
+                    labelColor=ink, labelFontSize=12,
+                    labelFontWeight=600, labelPadding=4,
+                ),
+            )
+        )
+        .resolve_scale(x="independent")
+        .configure_view(strokeOpacity=0)
+        .configure_axis(labelLimit=180),
+        width="stretch",
+    )
+    ranked_on = "points" if row_order == "Points" else rank_by.lower()
+    st.caption(
+        f"Top {len(order)} {noun}s by {ranked_on}, each metric as a percentile "
+        f"against every {noun} with {min_minutes}+ minutes"
+        + (", per 90" if per90 else "")
+        + f". Blue is above the median {noun}, red below. "
+        + PROFILE_NOTE[position]
+    )
+
+
+def _profile_ranking(
+    complete: pl.DataFrame,
+    sides: list[str],
+    rank_col: str,
+    rank_by: str,
+    theme: str,
+    ink: str,
+    surface: str,
+    noun: str,
+) -> None:
+    """The all-round ranking: a dumbbell of the two side scores per player.
+
+    The score is a mean of two numbers, so a bar of it says very little —
+    everyone near the top lands between 70 and 90 and the bars come out the same
+    length, with the printed number doing all the work. The two sides are what
+    actually differ: one man is 98 and 51, the next 71 and 95, and they score
+    the same. So plot both ends and let the gap between them be the shape of the
+    player; row order and the printed score carry the ranking. The axis stays
+    0-100 — cropping it to the occupied range would inflate small gaps.
+    """
+    board_n = min(RANK_ROWS, complete.height)
+    top_all = complete.head(board_n).with_columns(
+        pl.max_horizontal(*sides).alias("hi")
+    )
+    bdf = top_all.to_pandas()
+    rank_order = top_all["player"].to_list()
+    dumb = top_all.unpivot(
+        on=sides, index="player", variable_name="side", value_name="side_pct"
+    ).to_pandas()
+
+    ax = dict(
+        grid=True, gridOpacity=0.18, gridColor=ink, tickCount=6,
+        domain=False, ticks=False, labelColor=ink, titleColor=ink,
+        labelFontSize=11, titleFontSize=12, titlePadding=8,
+    )
+    y_enc = alt.Y(
+        "player:N",
+        sort=rank_order,
+        title=None,
+        axis=alt.Axis(
+            domain=False, ticks=False, labelColor=ink,
+            labelFontSize=11, labelPadding=8, labelLimit=160,
+        ),
+    )
+    # The connector is drawn first and kept faint: it is there to pair the two
+    # dots, not to be read itself.
+    connector = alt.Chart(bdf).mark_rule(
+        strokeWidth=2, opacity=0.35, color=ink
+    ).encode(
+        y=y_enc,
+        x=alt.X(f"{sides[0]}:Q", scale=alt.Scale(domain=[0, 100])),
+        x2=alt.X2(f"{sides[1]}:Q"),
+    )
+    dots = alt.Chart(dumb).mark_circle(
+        size=130, opacity=0.95, stroke=surface, strokeWidth=1.5
+    ).encode(
+        y=y_enc,
+        x=alt.X(
+            "side_pct:Q",
+            title=f"Percentile among {noun}s",
+            scale=alt.Scale(domain=[0, 100]),
+            axis=alt.Axis(**ax),
+        ),
+        color=alt.Color(
+            "side:N",
+            title=None,
+            scale=alt.Scale(domain=sides, range=PALETTE[theme][:2]),
+            legend=alt.Legend(
+                orient="top", labelColor=ink,
+                symbolStrokeWidth=0, labelFontSize=11,
+            ),
+        ),
+        tooltip=[
+            alt.Tooltip("player:N", title="Player"),
+            alt.Tooltip("side:N", title="Side"),
+            alt.Tooltip("side_pct:Q", title="Percentile", format=".1f"),
+        ],
+    )
+    # The score, printed past whichever dot sits furthest right so it never
+    # lands on one.
+    rank_nums = alt.Chart(bdf).mark_text(
+        align="left", dx=12, fontSize=11, fontWeight=600, color=ink,
+    ).encode(
+        y=y_enc,
+        x=alt.X("hi:Q", scale=alt.Scale(domain=[0, 100])),
+        # The number printed is the one the order is built on, so the column
+        # always reads as descending. Printing the all-round score while
+        # sorting on a side made the list look unsorted.
+        text=alt.Text(f"{rank_col}:Q", format=".0f"),
+        tooltip=[
+            alt.Tooltip("player:N", title="Player"),
+            alt.Tooltip("score:Q", title="All-round", format=".1f"),
+            *[alt.Tooltip(f"{s}:Q", title=s, format=".1f") for s in sides],
+            alt.Tooltip("flat:Q", title="Flat mean", format=".1f"),
+        ],
+    )
+    heading = (
+        f"Most complete {noun}s"
+        if rank_by == "All-round"
+        else f"Best {noun}s on {rank_by.lower()}"
+    )
+    st.markdown(f"**{heading}**")
+    st.altair_chart(
+        (connector + dots + rank_nums)
+        # An exact band step rather than a total height: the legend and axis eat
+        # into a fixed height and squeezed the rows to about 21px, close enough
+        # to run the names together.
+        .properties(height=alt.Step(28), padding={"right": 50, "top": 5})
+        .configure_view(strokeOpacity=0),
+        width="stretch",
+    )
+    others = " and ".join(s.lower() for s in sides if s != rank_by)
+    basis = (
+        f"the mean of their two side scores — {sides[0].lower()} and "
+        f"{sides[1].lower()} — each side averaged before the two are averaged "
+        "together, so a side is not weighted by how many columns it happens to "
+        "own. The flat mean is in the tooltip"
+        if rank_by == "All-round"
+        else f"{rank_by.lower()} alone, ignoring {others} entirely"
+    )
+    st.caption(
+        f"Top {board_n} of {complete.height} {noun}s on {basis}. The number at "
+        "the end of each row is what the order is built on, and the gap between "
+        f"the two dots is how lopsided the {noun} is. 50 is the median {noun} "
+        "on that side, not a midtable finish."
+    )
 
 
 def _slots(ids: list[int]) -> dict[int, int]:
@@ -541,6 +996,10 @@ with players:
                     width="stretch",
                 )
 
+            # --- position profiles -----------------------------------------
+            _profile_section("MID", view, min_minutes, per90, sfx, rank=True)
+            _profile_section("DEF", view, min_minutes, per90, sfx, rank=True)
+
             st.dataframe(table.head(200), hide_index=True, width="stretch")
             st.caption(
                 "FPL publishes no key-pass count — no pass, shot or chance "
@@ -580,7 +1039,7 @@ with compare:
             )
 
         cmp_per90 = cmp_basis == "Per 90"
-        board = _compare(pool_min, cmp_per90)
+        board = _compare(pool_min, cmp_per90, METRIC_KEY)
         options = {
             f"{r['web_name']} · {r['team_name']} ({r['position']})": r["fpl_id"]
             for r in board.iter_rows(named=True)
@@ -603,7 +1062,19 @@ with compare:
                 for label in picked
             }
             # Short names for the chart; the full label stays on the cards.
-            short = {label: label.split(" · ")[0] for label in picked}
+            # Two players can share a web_name, and the table below keys its
+            # columns by this name: an undisambiguated pair collapsed into one
+            # column, which then took two values per metric and threw a
+            # ShapeError against the metric list. The club separates them.
+            bare = [label.split(" · ")[0] for label in picked]
+            short = {
+                label: (
+                    f"{name} · {rows[label]['team_name']}"
+                    if bare.count(name) > 1
+                    else name
+                )
+                for label, name in zip(picked, bare)
+            }
             order = list(short.values())
 
             theme = _theme()
@@ -814,6 +1285,18 @@ with projection:
                 "Search player", placeholder="surname…", key="proj_search"
             )
 
+        rank_by = st.radio(
+            "Rank by",
+            STACK_RANKS,
+            horizontal=True,
+            key="proj_rank",
+            help=(
+                "Attack is goals plus assists; defence is clean sheets, "
+                "defensive contributions and saves. Pair it with a position "
+                "to find, say, the defenders who carry the most attacking threat."
+            ),
+        )
+
         if not gws:
             st.info("Pick at least one gameweek.")
         else:
@@ -875,8 +1358,16 @@ with projection:
                             *[pl.col(c).sum() for c in part_cols],
                             pl.col("xp").sum().alias("xp"),
                         )
-                        .with_columns((pl.col("xp") / pl.col("price")).alias("xp_per_m"))
-                        .sort("xp", descending=True, nulls_last=True)
+                        .with_columns(
+                            (pl.col("xp") / pl.col("price")).alias("xp_per_m"),
+                            *[
+                                pl.sum_horizontal(
+                                    [c for c, s in STACK_OF.items() if s == seg]
+                                ).alias(RANK_COL[seg])
+                                for seg in ("Attack", "Defence")
+                            ],
+                        )
+                        .sort(RANK_COL[rank_by], descending=True, nulls_last=True)
                     )
 
                     top_n = min(15, totals.height)
@@ -885,6 +1376,16 @@ with projection:
                     theme = _theme()
                     ink = "#52514e" if theme == "light" else "#c3c2b7"
                     ring = "#fcfcfb" if theme == "light" else "#1a1a19"
+
+                    # Ranked on one segment, that segment stacks first from
+                    # zero: lengths only compare along a shared baseline, and
+                    # an attack bar starting wherever appearance happens to
+                    # end would make the sort look wrong.
+                    stack_order = (
+                        STACK_ORDER
+                        if rank_by == "Total"
+                        else [rank_by] + [s for s in STACK_ORDER if s != rank_by]
+                    )
 
                     # Long form for the stack: five segments per player.
                     stacked = (
@@ -904,7 +1405,7 @@ with projection:
                         .with_columns(
                             pl.col("segment")
                             .replace_strict(
-                                {name: i for i, name in enumerate(STACK_ORDER)},
+                                {name: i for i, name in enumerate(stack_order)},
                                 return_dtype=pl.Int32,
                             )
                             .alias("rank")
@@ -962,11 +1463,161 @@ with projection:
                         .configure_view(strokeOpacity=0)
                     )
                     st.altair_chart(bars, width="stretch")
+                    ranked_on = {
+                        "Total": "expected points.",
+                        "Attack": "attacking points — goals and assists — "
+                                  "stacked first from zero so they line up.",
+                        "Defence": "defensive points — clean sheets, defensive "
+                                   "contributions and saves — stacked first "
+                                   "from zero so they line up.",
+                    }[rank_by]
                     st.caption(
-                        f"Top {top_n} by expected points. The deductions segment "
+                        f"Top {top_n} by {ranked_on} The deductions segment "
                         "runs left of zero — goals conceded and cards are the "
                         "only components that subtract."
                     )
+
+                    # --- projection against the midfield profile ------------
+                    # xP already contains both halves of the all-round score:
+                    # pts_assists is built from xa_per_90, and pts_defcon from
+                    # defensive_contribution_per_90, which for a midfielder is
+                    # tackles + clearances/blocks/int. + recoveries. So this is
+                    # not a second opinion on the same question — it crosses a
+                    # forecast in points against a season rank in percentiles,
+                    # and the axes are left in their own units precisely so the
+                    # score is never read as extra points.
+                    #
+                    # Worth the room for what xP throws away. pts_defcon is a
+                    # threshold: a midfielder at 13 CBIT/90 and one at 22 both
+                    # clear 12 nearly always and score the same, while the
+                    # percentile keeps separating them. And creativity is in
+                    # the score but in no part of the model at all.
+                    mid_totals = totals.filter(pl.col("position") == "MID")
+                    if not mid_totals.is_empty():
+                        # Per-90, not season totals. xP already models how
+                        # much of each fixture the player is likely to be on
+                        # the pitch for, so a totals profile would put his
+                        # minutes on both axes and reward availability twice.
+                        # Per-90 leaves this axis describing the player.
+                        crossed = mid_totals.join(
+                            _pos_scores("MID", min_mins, True, METRIC_KEY),
+                            on="fpl_id",
+                            how="inner",
+                        )
+                        st.markdown("**Projection against the season profile**")
+                        if crossed.height < 2:
+                            st.caption(
+                                "Fewer than two midfielders here hold a full "
+                                "season profile, so there is nothing to cross "
+                                "the projection against."
+                            )
+                        else:
+                            cross_plot = crossed.select(
+                                pl.col("web_name").alias("player"),
+                                pl.col("team_name").alias("team"),
+                                pl.col("xp").alias("x"),
+                                pl.col("score").alias("y"),
+                                pl.col("Creation").alias("creation"),
+                                pl.col("Ball-winning").alias("ball"),
+                                pl.col("price"),
+                                pl.col("xp_per_m"),
+                            ).drop_nulls(["x", "y"])
+                            xdf = cross_plot.to_pandas()
+                            cax = dict(
+                                grid=True, gridOpacity=0.18, gridColor=ink,
+                                tickCount=7, domain=False, ticks=False,
+                                labelColor=ink, titleColor=ink,
+                                labelFontSize=11, titleFontSize=12,
+                                titlePadding=8,
+                            )
+                            # The median line is the only reference that means
+                            # anything here: above it is an above-average
+                            # midfielder on both sides of the game, and it
+                            # splits the plot into the four reads worth having.
+                            median = (
+                                alt.Chart(pl.DataFrame({"m": [50.0]}).to_pandas())
+                                .mark_rule(
+                                    strokeDash=[4, 4], strokeWidth=1,
+                                    opacity=0.5, color=ink,
+                                )
+                                .encode(y="m:Q")
+                            )
+                            pts_x = alt.Chart(xdf).mark_circle(
+                                size=110, opacity=0.8, stroke=ring, strokeWidth=1.5
+                            ).encode(
+                                x=alt.X(
+                                    "x:Q",
+                                    title="Projected points over the chosen gameweeks",
+                                    axis=alt.Axis(**cax),
+                                ),
+                                y=alt.Y(
+                                    "y:Q",
+                                    title="All-round score (season percentile)",
+                                    scale=alt.Scale(domain=[0, 100]),
+                                    axis=alt.Axis(**cax),
+                                ),
+                                # One hue: price is on the axis of neither, so
+                                # colouring by it would spend the identity
+                                # channel on a third variable the reader did
+                                # not ask about. It is in the tooltip instead.
+                                color=alt.value(PALETTE[theme][0]),
+                                tooltip=[
+                                    alt.Tooltip("player:N", title="Player"),
+                                    alt.Tooltip("team:N", title="Team"),
+                                    alt.Tooltip("price:Q", title="£m", format=".1f"),
+                                    alt.Tooltip("x:Q", title="xP", format=".2f"),
+                                    alt.Tooltip("xp_per_m:Q", title="xP/£m", format=".2f"),
+                                    alt.Tooltip("y:Q", title="All-round", format=".0f"),
+                                    alt.Tooltip("creation:Q", title="Creation", format=".0f"),
+                                    alt.Tooltip("ball:Q", title="Ball-winning", format=".0f"),
+                                ],
+                            )
+                            # _labels ranks candidates on x + y and spaces them
+                            # as a fraction of each span. Here x is a points
+                            # total in single digits and y a percentile out of
+                            # 100, so fed raw it would pick on y alone and call
+                            # the highest scores the standouts whatever their
+                            # projection. Choose on an x rescaled to y's range,
+                            # then put the true coordinates back to draw.
+                            x_max = cross_plot["x"].max() or 1.0
+                            chosen = _labels(
+                                cross_plot.with_columns(
+                                    (pl.col("x") / x_max * 100).alias("x")
+                                )
+                            )
+                            labels_x = (
+                                alt.Chart(
+                                    cross_plot.filter(
+                                        pl.col("player").is_in(chosen["player"])
+                                    ).to_pandas()
+                                )
+                                .mark_text(
+                                    align="left", dx=9, dy=-5, fontSize=11,
+                                    color=ink,
+                                )
+                                .encode(x="x:Q", y="y:Q", text="player:N")
+                            )
+                            st.altair_chart(
+                                (median + pts_x + labels_x)
+                                .properties(height=360, padding={"right": 95, "top": 5})
+                                .configure_view(strokeOpacity=0),
+                                width="stretch",
+                            )
+                            st.caption(
+                                f"{cross_plot.height} midfielders. Right is a "
+                                "better projection for these fixtures; up is a "
+                                "better season on the profile per 90, against "
+                                f"every midfielder with {min_mins}+ minutes — "
+                                "per 90 because xP already accounts for minutes "
+                                "on its own axis. The two "
+                                "are not independent — xP already carries xA as "
+                                "assist points and tackles, clearances/blocks/"
+                                "int. and recoveries as defensive points — so "
+                                "read the corners, not the correlation. "
+                                "Top-right is form and substance agreeing; "
+                                "bottom-right is a projection resting on "
+                                "fixtures rather than on the player."
+                            )
 
                     flagged = totals.filter(pl.col("news").is_not_null()).head(6)
                     if not flagged.is_empty():
@@ -988,6 +1639,13 @@ with projection:
                             pl.col("opponents").alias("Fixtures"),
                             pl.col("fdr").round(1).alias("FDR"),
                             pl.col("xp").round(2).alias("xP"),
+                            # The sort key, when it is not xP itself, so the
+                            # table's order is visible rather than implied.
+                            *(
+                                [pl.col(RANK_COL[rank_by]).round(2).alias(rank_by)]
+                                if rank_by != "Total"
+                                else []
+                            ),
                             pl.col("xp_per_m").round(2).alias("xP/£m"),
                             *(
                                 [pl.col("ep_next").alias("FPL ep")]
