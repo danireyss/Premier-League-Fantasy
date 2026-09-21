@@ -24,17 +24,40 @@ minutes, on totals or per-90, with an xG-against-xA scatter.
 **Compare** — two to four players side by side, each metric as a percentile
 against positional peers, plus raw numbers and a delta column for exactly two.
 
-**Projection** — expected points for fixtures not yet played, broken into the
-components that make them up:
+**Projection** — expected points for fixtures not yet played, under the
+scoring of the league this is actually played in. BeManager does not pay for
+events the way FPL does: it converts the Sofascore match rating through a band
+table and pays a goal bonus on top. So the model projects a *rating*, and since
+the bands are a step function it integrates a distribution across them rather
+than looking up a point estimate:
 
 ```
-xP = appearance + goals + assists + clean sheet + defensive contribution
-     + saves + bonus − goals conceded − cards
+xP = P(features) × E[band points | rating ~ N(mu, sigma)]
+     + goal bonus × xG + assist bonus × xA
 ```
+
+That changes what is worth owning. Involvement beats end product, a bad game
+costs real points — the table runs to −4 — and a substitute's cameo is cheap
+rather than wasted, since Sofascore rates from ten minutes and everyone starts
+at 6.5. The tab ranks on ceiling (chance of a 10+ return) and floor (chance of
+a negative one) as well as on the total.
 
 Filterable by gameweek, position, club, price, minutes and name. Club attack
-and defence ratings are derived from matches already played, so it has nothing
-to show until the season's first gameweek has finished.
+and defence ratings come from matches already played, so it has nothing to show
+until the season's first gameweek has finished.
+
+**Read the caveats in the tab.** Sofascore's rating is a machine-learning model
+that weights each action by context, so no fixed tariff over FPL totals can
+reproduce it — and of its five categories, *passing* and *dribbling* have no
+counter anywhere in this feed. Of the eight negative factors it names, the feed
+carries three. Constants are marked `[DOC]` in `config.py` where Sofascore
+publishes the value and `[PRIOR]` where the number is a guess.
+
+The way out is ground truth. The tab has a panel for recording what players
+actually returned, and each player's own recorded ratings progressively
+displace the structural estimate for him — half-and-half at four ratings. The
+FPL scoring model stays in `project.py` and `queries.projections` so the two
+can be compared.
 
 **Fantasy** — live gameweek scoring beside the performance driving it. Fills
 once a gameweek is under way.

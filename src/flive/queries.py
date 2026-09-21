@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 
 import polars as pl
 
-from . import project, store
+from . import league, project, store
 
 # Stats that only ever increase within a gameweek, so last minus first over a
 # window is the amount added during it.
@@ -310,6 +310,36 @@ POSITION_PROFILES: dict[str, dict[str, str]] = {
 }
 
 
+# --- the peer pool -------------------------------------------------------
+# A percentile is only readable if the pool behind it holds still, so the pool
+# is the app's rule rather than a control anyone drags. Wiring it to a display
+# filter meant a player read 90th with the filter down and 60th with it up, on
+# identical numbers, and neither figure was wrong -- they answered different
+# questions, and nothing on screen said which.
+#
+# The bar scales with the season instead of sitting at a constant. A fixed
+# 450-minute bar is the right shape for "a regular" in May and empties the pool
+# outright in August, when nobody has played 450 minutes yet.
+PEER_POOL_SHARE = 0.30
+PEER_POOL_FLOOR = 90
+
+
+def peer_pool_minutes(board: pl.DataFrame) -> int:
+    """The minutes a player clears to enter the percentile pool.
+
+    Thirty per cent of what the busiest player in the league has played --
+    near enough "has been part of his side's season" at any point in it --
+    floored at a full match so the pool is never so thin that a cameo ranks.
+    The floor also matches `compare_board`, which declines to scale a per-90
+    figure below 90 minutes: one bright substitute appearance divided by a
+    tenth of a match outranks a season otherwise.
+    """
+    if board.is_empty():
+        return PEER_POOL_FLOOR
+    busiest = int(board["minutes"].max() or 0)
+    return max(PEER_POOL_FLOOR, int(busiest * PEER_POOL_SHARE))
+
+
 def profile_sides(position: str) -> list[str]:
     """The sides a position's profile splits into, in the order it draws them."""
     return list(dict.fromkeys(POSITION_PROFILES[position].values()))
@@ -503,6 +533,28 @@ def projections(gws: list[int] | None = None) -> pl.DataFrame:
         return pl.DataFrame()
 
     return project.expected_points(players, upcoming, _played_matches())
+
+
+def league_projections(gws: list[int] | None = None) -> pl.DataFrame:
+    """Expected points per player per upcoming fixture, under BeManager scoring.
+
+    Same shape as `projections`, from the same three inputs, but scored through
+    the Sofascore rating band table rather than FPL's event tariff. Keeping
+    both is the point: where they disagree is where the league being played
+    diverges from the one this data was published for.
+    """
+    sched = latest_schedule()
+    if sched.is_empty():
+        return pl.DataFrame()
+    upcoming = sched.filter(~pl.col("finished"))
+    if gws:
+        upcoming = upcoming.filter(pl.col("gw").is_in(gws))
+    if upcoming.is_empty():
+        return pl.DataFrame()
+    players = player_board()
+    if players.is_empty():
+        return pl.DataFrame()
+    return league.expected_points(players, upcoming, _played_matches())
 
 
 def team_strength() -> pl.DataFrame:

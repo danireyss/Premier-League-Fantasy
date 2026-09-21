@@ -12,7 +12,7 @@ import altair as alt
 import polars as pl
 import streamlit as st
 
-from flive import project, queries
+from flive import league, queries
 
 st.set_page_config(page_title="Live match analysis", layout="wide")
 
@@ -118,8 +118,55 @@ def _excluded_note(named: pl.DataFrame, min_mins: int, max_price: float,
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def _projections(gws: tuple[int, ...]) -> pl.DataFrame:
-    return queries.projections(list(gws))
+def _league_projections(gws: tuple[int, ...]) -> pl.DataFrame:
+    return queries.league_projections(list(gws))
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _observed_ratings() -> pl.DataFrame:
+    return league.observed_ratings()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _calibration() -> pl.DataFrame:
+    return league.calibration()
+
+
+def _resolve_returns(edited, gw: int) -> tuple[list[dict], list[str]]:
+    """Turn edited rows into `league_scores` rows, reporting names that missed.
+
+    Matching is on web_name, case-folded, falling back to a unique substring:
+    the editor takes free text so that entering a gameweek is not fifteen trips
+    through a six-hundred-name dropdown, and the cost of that is saying plainly
+    when a name found nobody rather than dropping it silently.
+    """
+    board = _players()
+    if board.is_empty():
+        return [], []
+    frame = edited if isinstance(edited, pl.DataFrame) else pl.from_pandas(edited)
+    lookup = {
+        name.casefold(): (fid, name)
+        for fid, name in zip(board["fpl_id"].to_list(), board["web_name"].to_list())
+    }
+    rows: list[dict] = []
+    unmatched: list[str] = []
+    for r in frame.iter_rows(named=True):
+        typed = (r.get("player") or "").strip()
+        if not typed or (r.get("points") is None and r.get("rating") is None):
+            continue
+        hit = lookup.get(typed.casefold())
+        if hit is None:
+            partial = [v for k, v in lookup.items() if typed.casefold() in k]
+            if len(partial) != 1:
+                unmatched.append(typed)
+                continue
+            hit = partial[0]
+        rows.append({
+            "gw": gw, "fpl_id": hit[0], "web_name": hit[1],
+            "points": int(r["points"]) if r.get("points") is not None else None,
+            "rating": float(r["rating"]) if r.get("rating") is not None else None,
+        })
+    return rows, unmatched
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -207,40 +254,22 @@ COMPARE_PALETTE = {
 }
 MAX_COMPARE = 4
 
-# The projection stack. Deductions take the red slot and everything else runs
-# in slot order: red reads as the negative pole, and the deduction segment is
-# the one that stacks left of zero. Validated on the pairs that actually touch
-# on screen — deductions | 0 | appearance, attack, defence, bonus — which is
-# not list order, since nothing ever renders yellow beside red.
-STACK = {
-    "light": {
-        "Appearance": "#2a78d6", "Attack": "#eb6834", "Defence": "#1baf7a",
-        "Bonus": "#eda100", "Deductions": "#e34948",
-    },
-    "dark": {
-        "Appearance": "#3987e5", "Attack": "#d95926", "Defence": "#199e70",
-        "Bonus": "#c98500", "Deductions": "#e66767",
-    },
+# The BeManager stack. Three components, not nine: the rating is one number
+# that already contains everything a player did, and only the goal and assist
+# bonuses sit outside it. Slots 1-3 of the categorical order, which is the run
+# that stays separable for a colourblind reader.
+LEAGUE_STACK = {
+    "light": {"Rating": "#2a78d6", "Goal bonus": "#eb6834", "Assist bonus": "#1baf7a"},
+    "dark": {"Rating": "#3987e5", "Goal bonus": "#d95926", "Assist bonus": "#199e70"},
 }
-# How the nine scoring components collapse into the five the chart stacks. The
-# table below it keeps all nine — past about seven classes adjacent colours
-# blur, and the detail belongs in a table anyway.
-STACK_OF = {
-    "pts_appearance": "Appearance",
-    "pts_goals": "Attack",
-    "pts_assists": "Attack",
-    "pts_clean_sheet": "Defence",
-    "pts_defcon": "Defence",
-    "pts_saves": "Defence",
-    "pts_bonus": "Bonus",
-    "pts_conceded": "Deductions",
-    "pts_cards": "Deductions",
+LEAGUE_STACK_ORDER = ["Rating", "Goal bonus", "Assist bonus"]
+# Ceiling and floor are worth ranking on directly in a league whose table pays
+# down to -4: one format pays for hauls, this one also charges for bad games.
+LEAGUE_RANKS = ["Total", "Rating", "Ceiling", "Floor"]
+LEAGUE_RANK_COL = {
+    "Total": "xp", "Rating": "rating_mu",
+    "Ceiling": "p_excellent", "Floor": "p_negative",
 }
-STACK_ORDER = ["Appearance", "Attack", "Defence", "Bonus", "Deductions"]
-# What the projection can be ranked by, and the column in the per-player totals
-# each one sorts on. Attack and defence are stack segments summed back up.
-STACK_RANKS = ["Total", "Attack", "Defence"]
-RANK_COL = {"Total": "xp", "Attack": "pts_attack", "Defence": "pts_defence"}
 
 
 def _theme() -> str:
@@ -306,7 +335,7 @@ PROFILE_NOTE = {
 def _profile_section(
     position: str,
     view: pl.DataFrame,
-    min_minutes: int,
+    pool_minutes: int,
     per90: bool,
     sfx: str,
     rank: bool,
@@ -345,10 +374,12 @@ def _profile_section(
     # Percentiles come from the compare board, which ranks within position: 5
     # tackles means nothing next to a centre-back's and everything next to
     # another midfielder's. The pool is every player at the position clearing
-    # the minutes filter, deliberately not the ones left after team and search —
-    # filtering to one club would rank its players against each other and call
-    # the best of them elite.
-    board = _compare(min_minutes, per90, METRIC_KEY)
+    # `queries.peer_pool_minutes` — not the ones left after the filters above
+    # it. None of them belong in it. Filtering to one club would rank its
+    # players against each other and call the best of them elite; wiring the
+    # pool to the minutes slider made a percentile move when a viewer was only
+    # decluttering the table, which is the same fault wearing a friendlier hat.
+    board = _compare(pool_minutes, per90, METRIC_KEY)
     # Belt as well as braces on the cache key above: whatever the reason a board
     # arrives without a metric's percentile column, say so and draw nothing
     # rather than dying inside a select and taking the whole page with it.
@@ -387,8 +418,9 @@ def _profile_section(
     st.markdown(f"**{noun.capitalize()} profile**")
     if cells_all.is_empty():
         st.caption(
-            f"No {noun} here clears the minutes filter, so there is no peer "
-            "pool to rank against. Lower it to fill this in."
+            f"No {noun} on screen has played the {pool_minutes} minutes that "
+            "put a player in the ranked pool, so there is nothing to draw a "
+            "percentile against. Widen the filters to bring in regulars."
         )
         return
 
@@ -400,7 +432,7 @@ def _profile_section(
     complete = (
         labelled.select("fpl_id", "label")
         .join(
-            _pos_scores(position, min_minutes, per90, METRIC_KEY),
+            _pos_scores(position, pool_minutes, per90, METRIC_KEY),
             on="fpl_id",
             how="inner",
         )
@@ -545,7 +577,7 @@ def _profile_section(
     ranked_on = "points" if row_order == "Points" else rank_by.lower()
     st.caption(
         f"Top {len(order)} {noun}s by {ranked_on}, each metric as a percentile "
-        f"against every {noun} with {min_minutes}+ minutes"
+        f"against every {noun} with {pool_minutes}+ minutes"
         + (", per 90" if per90 else "")
         + f". Blue is above the median {noun}, red below. "
         + PROFILE_NOTE[position]
@@ -879,7 +911,17 @@ with players:
             )
         with f3:
             max_min = int(pb["minutes"].max() or 0)
-            min_minutes = st.slider("Minimum minutes", 0, max(max_min, 1), min(90, max_min))
+            min_minutes = st.slider(
+                "Minimum minutes",
+                0,
+                max(max_min, 1),
+                min(90, max_min),
+                help=(
+                    "Hides players below the bar. It does not change anybody's "
+                    "percentile — those are always against the same pool of "
+                    f"regulars ({queries.peer_pool_minutes(pb)}+ minutes)."
+                ),
+            )
         with f4:
             basis = st.radio("Basis", ["Totals", "Per 90"], horizontal=True)
 
@@ -997,8 +1039,9 @@ with players:
                 )
 
             # --- position profiles -----------------------------------------
-            _profile_section("MID", view, min_minutes, per90, sfx, rank=True)
-            _profile_section("DEF", view, min_minutes, per90, sfx, rank=True)
+            pool_minutes = queries.peer_pool_minutes(pb)
+            _profile_section("MID", view, pool_minutes, per90, sfx, rank=True)
+            _profile_section("DEF", view, pool_minutes, per90, sfx, rank=True)
 
             st.dataframe(table.head(200), hide_index=True, width="stretch")
             st.caption(
@@ -1018,26 +1061,17 @@ with compare:
             "start the ingest daemon with `uv run flive-ingest`."
         )
     else:
-        c1, c2, c3 = st.columns([5, 1.5, 2.5])
+        c1, c2 = st.columns([6.5, 2])
         with c2:
             cmp_basis = st.radio(
                 "Basis", ["Totals", "Per 90"], horizontal=True, key="cmp_basis"
             )
-        with c3:
-            pool_max = int(pool["minutes"].max() or 0)
-            pool_min = st.slider(
-                "Peer pool: minimum minutes",
-                0,
-                max(pool_max, 1),
-                min(90, pool_max),
-                step=15,
-                help=(
-                    "Who a player is ranked against. Raising this drops cameo "
-                    "appearances out of the pool, so percentiles compare him "
-                    "against regulars rather than against everyone."
-                ),
-            )
 
+        # The same pool the Players tab ranks against, so a player reads the
+        # same percentile on both. This was a slider, honestly labelled — but
+        # an honest label does not stop two tabs disagreeing about a number
+        # that has one right answer.
+        pool_min = queries.peer_pool_minutes(pool)
         cmp_per90 = cmp_basis == "Per 90"
         board = _compare(pool_min, cmp_per90, METRIC_KEY)
         options = {
@@ -1102,7 +1136,8 @@ with compare:
             thin = [label for label in picked if rows[label]["minutes"] < pool_min]
             if thin:
                 st.caption(
-                    "Below the pool threshold, so unranked: "
+                    f"Short of the {pool_min} minutes that earn a ranking, so "
+                    "unranked: "
                     + ", ".join(short[label] for label in thin)
                     + ". Their raw numbers are in the table; the bars leave them out."
                 )
@@ -1239,35 +1274,86 @@ with projection:
         )
     else:
         st.caption(
-            "Expected points for fixtures not yet played, built from club "
-            "attack and defence ratings, the opponent, the venue and how much "
-            "of a match each player is likely to be on the pitch for. FPL "
-            "publishes a projection of its own; this one does not look at it, "
-            "so the two can be compared."
+            "Expected points under BeManager scoring: the Sofascore match "
+            "rating converted through the league's band table, with the goal "
+            "bonus on top. Every player starts at 6.5 and moves from there, "
+            "and the conversion integrates a distribution across the bands "
+            "rather than looking up one number — with bands 0.2 wide, a "
+            "projection on an edge is worth close to a point either way."
         )
+
+        obs = _observed_ratings()
+        rated = int(obs["obs_n"].sum()) if not obs.is_empty() else 0
+        if rated == 0:
+            st.warning(
+                "**Running on priors alone.** Sofascore weights every action "
+                "by context, so no fixed tariff built on FPL totals can "
+                "reproduce it — and two of its five categories, passing and "
+                "dribbling, are absent from this feed entirely. Record ratings "
+                "below and each player's own history replaces the guesses for "
+                "him. Until then, read the ordering and not the numbers.",
+                icon="⚠️",
+            )
+        else:
+            st.success(
+                f"{rated} rating(s) recorded across "
+                f"{obs.height} player(s) — those players are projected partly "
+                f"on their own history rather than on the model's priors.",
+                icon="✅",
+            )
+
+        with st.expander("What this model can and cannot see"):
+            st.caption(
+                "Sofascore names sixteen key factors. Against the 109 fields "
+                "the FPL API publishes, six have a direct counter, two have "
+                "only a proxy, three arrive bundled inside a summed column, "
+                "and five have no counter of any kind. Four of those five are "
+                "negatives, which is why this model runs optimistic: it sees "
+                "most of what lifts a rating and little of what drags one down."
+            )
+            st.dataframe(
+                league.factor_table(), hide_index=True, width="stretch",
+                column_config={
+                    "Status": st.column_config.TextColumn(
+                        "Status",
+                        help="modelled = a direct counter · proxy = something "
+                             "related stands in · bundled = real but summed with "
+                             "lesser actions and inseparable · missing = no "
+                             "counter anywhere in the feed.",
+                    ),
+                },
+            )
+            st.caption(
+                "The bundled three — a clearance off the line, a last-man "
+                "tackle, a diving save — are the sharpest loss. Each is a "
+                "high-value *specific* action that reaches this feed as an "
+                "ordinary clearance, tackle or save, so the context Sofascore "
+                "weights most heavily is the context the feed flattens."
+            )
+            st.markdown("**By category**")
+            for name, (covered, note) in league.COVERAGE.items():
+                st.markdown(f"{'✅' if covered else '❌'} **{name}** — {note}")
 
         g1, g2, g3 = st.columns([2.2, 2, 2.4])
         with g1:
             gws = st.multiselect(
-                "Gameweeks",
-                gw_options,
-                default=gw_options[:1],
+                "Gameweeks", gw_options, default=gw_options[:1],
                 help=(
-                    "Pick several to project a run of fixtures. Totals sum "
-                    "every fixture a club has in the range, so a double "
-                    "gameweek counts twice and a blank counts as nothing."
+                    "Pick several to project a run. Totals sum every fixture a "
+                    "club has in the range, so a double gameweek counts twice "
+                    "and a blank counts as nothing."
                 ),
             )
         with g2:
             pos_pick = st.multiselect(
-                "Position", ["GKP", "DEF", "MID", "FWD"], default=["GKP", "DEF", "MID", "FWD"]
+                "Position", ["GKP", "DEF", "MID", "FWD"],
+                default=["GKP", "DEF", "MID", "FWD"],
             )
         with g3:
             team_pick = st.multiselect(
                 "Team",
                 sorted(_players()["team_name"].drop_nulls().unique().to_list()),
-                key="proj_teams",
-                help="Empty means every club.",
+                key="proj_teams", help="Empty means every club.",
             )
 
         g4, g5, g6 = st.columns([2.2, 2, 2.4])
@@ -1276,9 +1362,8 @@ with projection:
         with g5:
             min_mins = st.number_input(
                 "Min minutes played", 0, 3000, 90, step=90,
-                help="Season minutes so far. Every rate in the model divides by "
-                     "these, so a low bar lets in players whose numbers rest on "
-                     "a cameo.",
+                help="Season minutes so far. Every rate divides by these, so a "
+                     "low bar lets in players whose numbers rest on a cameo.",
             )
         with g6:
             name_search = st.text_input(
@@ -1286,33 +1371,25 @@ with projection:
             )
 
         rank_by = st.radio(
-            "Rank by",
-            STACK_RANKS,
-            horizontal=True,
-            key="proj_rank",
+            "Rank by", LEAGUE_RANKS, horizontal=True, key="proj_rank",
             help=(
-                "Attack is goals plus assists; defence is clean sheets, "
-                "defensive contributions and saves. Pair it with a position "
-                "to find, say, the defenders who carry the most attacking threat."
+                "Ceiling is the chance of a 10+ return, floor the chance of a "
+                "negative one. The band table pays down to −4, so a floor is a "
+                "real cost and not just missed upside."
             ),
         )
 
         if not gws:
             st.info("Pick at least one gameweek.")
         else:
-            proj = _projections(tuple(sorted(gws)))
+            proj = _league_projections(tuple(sorted(gws)))
             if proj.is_empty():
                 st.warning(
                     "Nothing to project yet. Club attack and defence ratings "
-                    "are derived from matches already played, so there is "
-                    "nothing to build on until the season's first gameweek "
-                    "has finished."
+                    "come from matches already played, so there is nothing to "
+                    "build on until the season's first gameweek has finished."
                 )
             else:
-                # The name search runs first and alone, so that when the
-                # other filters then empty the result we can say which player
-                # was found and what excluded him — a bare "no matches" reads
-                # as the player being absent from the data entirely.
                 named = proj.filter(_name_match(name_search)) if name_search else proj
                 view = named.filter(
                     (pl.col("minutes") >= min_mins)
@@ -1334,9 +1411,7 @@ with projection:
                     else:
                         st.warning("No players match those filters.")
                 else:
-                    # One row per player per fixture, so a run of gameweeks —
-                    # and a double inside one — collapses by summing.
-                    part_cols = list(project.COMPONENTS)
+                    part_cols = list(league.POINT_COMPONENTS)
                     totals = (
                         view.group_by("fpl_id")
                         .agg(
@@ -1346,12 +1421,17 @@ with projection:
                             pl.col("price").first(),
                             pl.col("minutes").first(),
                             pl.col("xmins").mean().alias("xmins"),
-                            pl.col("p60").first(),
-                            pl.col("ep_next").first(),
                             pl.col("selected_by_pct").first(),
-                            pl.col("news").first(),
                             pl.len().alias("fixtures"),
-                            pl.col("difficulty").mean().alias("fdr"),
+                            # A rating is per match, so it averages across a
+                            # run; the points it produces sum.
+                            pl.col("rating_mu").mean().alias("rating_mu"),
+                            pl.col("obs_n").first(),
+                            pl.col("obs_weight").first(),
+                            # Chance of at least one such return in the range,
+                            # which is neither the sum nor the mean.
+                            (1.0 - (1.0 - pl.col("p_excellent")).product()).alias("p_excellent"),
+                            (1.0 - (1.0 - pl.col("p_negative")).product()).alias("p_negative"),
                             pl.concat_str(
                                 [pl.col("opponent"), pl.col("venue")], separator=" ("
                             ).add(")").str.join(", ").alias("opponents"),
@@ -1360,60 +1440,38 @@ with projection:
                         )
                         .with_columns(
                             (pl.col("xp") / pl.col("price")).alias("xp_per_m"),
-                            *[
-                                pl.sum_horizontal(
-                                    [c for c, s in STACK_OF.items() if s == seg]
-                                ).alias(RANK_COL[seg])
-                                for seg in ("Attack", "Defence")
-                            ],
+                            pl.when(pl.col("obs_weight") >= 0.6).then(pl.lit("observed"))
+                            .when(pl.col("obs_weight") > 0).then(pl.lit("blended"))
+                            .otherwise(pl.lit("prior")).alias("basis"),
                         )
-                        .sort(RANK_COL[rank_by], descending=True, nulls_last=True)
+                        .sort(LEAGUE_RANK_COL[rank_by],
+                              descending=rank_by != "Floor", nulls_last=True)
                     )
 
                     top_n = min(15, totals.height)
                     top = totals.head(top_n)
-
                     theme = _theme()
                     ink = "#52514e" if theme == "light" else "#c3c2b7"
                     ring = "#fcfcfb" if theme == "light" else "#1a1a19"
 
-                    # Ranked on one segment, that segment stacks first from
-                    # zero: lengths only compare along a shared baseline, and
-                    # an attack bar starting wherever appearance happens to
-                    # end would make the sort look wrong.
-                    stack_order = (
-                        STACK_ORDER
-                        if rank_by == "Total"
-                        else [rank_by] + [s for s in STACK_ORDER if s != rank_by]
-                    )
-
-                    # Long form for the stack: five segments per player.
                     stacked = (
                         top.select("web_name", *part_cols)
                         .unpivot(index="web_name", variable_name="part", value_name="pts")
                         .with_columns(
                             pl.col("part")
-                            .replace_strict(STACK_OF, return_dtype=pl.Utf8)
+                            .replace_strict(league.POINT_COMPONENTS, return_dtype=pl.Utf8)
                             .alias("segment")
                         )
-                        .group_by("web_name", "segment")
-                        .agg(pl.col("pts").sum())
                         .filter(pl.col("pts").abs() > 0.005)
-                        # Vega orders a stack alphabetically unless told
-                        # otherwise, which would put Bonus before Defence and
-                        # leave the segments in a different order per bar.
                         .with_columns(
-                            pl.col("segment")
-                            .replace_strict(
-                                {name: i for i, name in enumerate(stack_order)},
+                            pl.col("segment").replace_strict(
+                                {n: i for i, n in enumerate(LEAGUE_STACK_ORDER)},
                                 return_dtype=pl.Int32,
-                            )
-                            .alias("rank")
+                            ).alias("rank")
                         )
                     )
                     order = top["web_name"].to_list()
-                    colors = [STACK[theme][s] for s in STACK_ORDER]
-
+                    colors = [LEAGUE_STACK[theme][s] for s in LEAGUE_STACK_ORDER]
                     ax = dict(
                         grid=True, gridOpacity=0.18, gridColor=ink, tickCount=6,
                         domain=False, ticks=False, labelColor=ink, titleColor=ink,
@@ -1428,284 +1486,130 @@ with projection:
                                 axis=alt.Axis(
                                     domain=False, ticks=False, labelColor=ink,
                                     labelFontSize=11, labelPadding=8, labelLimit=160,
+                                    # Vega thins dense tick labels by default,
+                                    # which drops every other player's name.
+                                    labelOverlap=False,
                                 ),
                             ),
-                            x=alt.X(
-                                "pts:Q",
-                                title="Expected points"
-                                + (f" over {len(gws)} gameweeks" if len(gws) > 1 else ""),
-                                axis=alt.Axis(**ax),
-                            ),
+                            x=alt.X("pts:Q", title="Expected points", axis=alt.Axis(**ax)),
                             color=alt.Color(
-                                "segment:N",
-                                title=None,
-                                scale=alt.Scale(domain=STACK_ORDER, range=colors),
-                                sort=STACK_ORDER,
+                                "segment:N", sort=LEAGUE_STACK_ORDER,
+                                scale=alt.Scale(domain=LEAGUE_STACK_ORDER, range=colors),
                                 legend=alt.Legend(
-                                    labelColor=ink, orient="top",
-                                    symbolStrokeWidth=0, symbolType="square",
+                                    title=None, orient="top", direction="horizontal",
+                                    labelColor=ink, labelFontSize=11, symbolType="square",
                                 ),
                             ),
                             order=alt.Order("rank:Q", sort="ascending"),
                             tooltip=[
                                 alt.Tooltip("web_name:N", title="Player"),
-                                alt.Tooltip("segment:N", title="From"),
+                                alt.Tooltip("segment:N", title="Component"),
                                 alt.Tooltip("pts:Q", title="Points", format=".2f"),
                             ],
                         )
-                        .properties(
-                            # Floored: Vega drops every other axis label when
-                            # the plot is short, so a two-player result would
-                            # silently lose a name.
-                            height=max(120, 34 * top_n),
-                            padding={"right": 20, "top": 5},
-                        )
-                        .configure_view(strokeOpacity=0)
+                        .properties(height=max(200, 26 * top_n))
                     )
                     st.altair_chart(bars, width="stretch")
-                    ranked_on = {
-                        "Total": "expected points.",
-                        "Attack": "attacking points — goals and assists — "
-                                  "stacked first from zero so they line up.",
-                        "Defence": "defensive points — clean sheets, defensive "
-                                   "contributions and saves — stacked first "
-                                   "from zero so they line up.",
-                    }[rank_by]
                     st.caption(
-                        f"Top {top_n} by {ranked_on} The deductions segment "
-                        "runs left of zero — goals conceded and cards are the "
-                        "only components that subtract."
+                        "Rating is what the performance itself pays, before a "
+                        "ball hits the net — for most players it is the whole "
+                        "return. A quiet 6.5 is worth 2 points, so the bonus "
+                        "only separates the forwards who are actually scoring."
                     )
 
-                    # --- projection against the midfield profile ------------
-                    # xP already contains both halves of the all-round score:
-                    # pts_assists is built from xa_per_90, and pts_defcon from
-                    # defensive_contribution_per_90, which for a midfielder is
-                    # tackles + clearances/blocks/int. + recoveries. So this is
-                    # not a second opinion on the same question — it crosses a
-                    # forecast in points against a season rank in percentiles,
-                    # and the axes are left in their own units precisely so the
-                    # score is never read as extra points.
-                    #
-                    # Worth the room for what xP throws away. pts_defcon is a
-                    # threshold: a midfielder at 13 CBIT/90 and one at 22 both
-                    # clear 12 nearly always and score the same, while the
-                    # percentile keeps separating them. And creativity is in
-                    # the score but in no part of the model at all.
-                    mid_totals = totals.filter(pl.col("position") == "MID")
-                    if not mid_totals.is_empty():
-                        # Per-90, not season totals. xP already models how
-                        # much of each fixture the player is likely to be on
-                        # the pitch for, so a totals profile would put his
-                        # minutes on both axes and reward availability twice.
-                        # Per-90 leaves this axis describing the player.
-                        crossed = mid_totals.join(
-                            _pos_scores("MID", min_mins, True, METRIC_KEY),
-                            on="fpl_id",
-                            how="inner",
-                        )
-                        st.markdown("**Projection against the season profile**")
-                        if crossed.height < 2:
-                            st.caption(
-                                "Fewer than two midfielders here hold a full "
-                                "season profile, so there is nothing to cross "
-                                "the projection against."
-                            )
-                        else:
-                            cross_plot = crossed.select(
-                                pl.col("web_name").alias("player"),
-                                pl.col("team_name").alias("team"),
-                                pl.col("xp").alias("x"),
-                                pl.col("score").alias("y"),
-                                pl.col("Creation").alias("creation"),
-                                pl.col("Ball-winning").alias("ball"),
-                                pl.col("price"),
-                                pl.col("xp_per_m"),
-                            ).drop_nulls(["x", "y"])
-                            xdf = cross_plot.to_pandas()
-                            cax = dict(
-                                grid=True, gridOpacity=0.18, gridColor=ink,
-                                tickCount=7, domain=False, ticks=False,
-                                labelColor=ink, titleColor=ink,
-                                labelFontSize=11, titleFontSize=12,
-                                titlePadding=8,
-                            )
-                            # The median line is the only reference that means
-                            # anything here: above it is an above-average
-                            # midfielder on both sides of the game, and it
-                            # splits the plot into the four reads worth having.
-                            median = (
-                                alt.Chart(pl.DataFrame({"m": [50.0]}).to_pandas())
-                                .mark_rule(
-                                    strokeDash=[4, 4], strokeWidth=1,
-                                    opacity=0.5, color=ink,
-                                )
-                                .encode(y="m:Q")
-                            )
-                            pts_x = alt.Chart(xdf).mark_circle(
-                                size=110, opacity=0.8, stroke=ring, strokeWidth=1.5
-                            ).encode(
-                                x=alt.X(
-                                    "x:Q",
-                                    title="Projected points over the chosen gameweeks",
-                                    axis=alt.Axis(**cax),
-                                ),
-                                y=alt.Y(
-                                    "y:Q",
-                                    title="All-round score (season percentile)",
-                                    scale=alt.Scale(domain=[0, 100]),
-                                    axis=alt.Axis(**cax),
-                                ),
-                                # One hue: price is on the axis of neither, so
-                                # colouring by it would spend the identity
-                                # channel on a third variable the reader did
-                                # not ask about. It is in the tooltip instead.
-                                color=alt.value(PALETTE[theme][0]),
-                                tooltip=[
-                                    alt.Tooltip("player:N", title="Player"),
-                                    alt.Tooltip("team:N", title="Team"),
-                                    alt.Tooltip("price:Q", title="£m", format=".1f"),
-                                    alt.Tooltip("x:Q", title="xP", format=".2f"),
-                                    alt.Tooltip("xp_per_m:Q", title="xP/£m", format=".2f"),
-                                    alt.Tooltip("y:Q", title="All-round", format=".0f"),
-                                    alt.Tooltip("creation:Q", title="Creation", format=".0f"),
-                                    alt.Tooltip("ball:Q", title="Ball-winning", format=".0f"),
-                                ],
-                            )
-                            # _labels ranks candidates on x + y and spaces them
-                            # as a fraction of each span. Here x is a points
-                            # total in single digits and y a percentile out of
-                            # 100, so fed raw it would pick on y alone and call
-                            # the highest scores the standouts whatever their
-                            # projection. Choose on an x rescaled to y's range,
-                            # then put the true coordinates back to draw.
-                            x_max = cross_plot["x"].max() or 1.0
-                            chosen = _labels(
-                                cross_plot.with_columns(
-                                    (pl.col("x") / x_max * 100).alias("x")
-                                )
-                            )
-                            labels_x = (
-                                alt.Chart(
-                                    cross_plot.filter(
-                                        pl.col("player").is_in(chosen["player"])
-                                    ).to_pandas()
-                                )
-                                .mark_text(
-                                    align="left", dx=9, dy=-5, fontSize=11,
-                                    color=ink,
-                                )
-                                .encode(x="x:Q", y="y:Q", text="player:N")
-                            )
-                            st.altair_chart(
-                                (median + pts_x + labels_x)
-                                .properties(height=360, padding={"right": 95, "top": 5})
-                                .configure_view(strokeOpacity=0),
-                                width="stretch",
-                            )
-                            st.caption(
-                                f"{cross_plot.height} midfielders. Right is a "
-                                "better projection for these fixtures; up is a "
-                                "better season on the profile per 90, against "
-                                f"every midfielder with {min_mins}+ minutes — "
-                                "per 90 because xP already accounts for minutes "
-                                "on its own axis. The two "
-                                "are not independent — xP already carries xA as "
-                                "assist points and tackles, clearances/blocks/"
-                                "int. and recoveries as defensive points — so "
-                                "read the corners, not the correlation. "
-                                "Top-right is form and substance agreeing; "
-                                "bottom-right is a projection resting on "
-                                "fixtures rather than on the player."
-                            )
-
-                    flagged = totals.filter(pl.col("news").is_not_null()).head(6)
-                    if not flagged.is_empty():
-                        with st.expander(f"{flagged.height} of these carry an FPL news flag"):
-                            for r in flagged.iter_rows(named=True):
-                                st.caption(f"**{r['web_name']}** — {r['news']}")
-
-                    # FPL's own projection covers the next gameweek and nothing
-                    # further, so it only belongs beside xP when the horizon is
-                    # one gameweek too. Comparing it with a three-week total
-                    # would read as this model being wildly optimistic.
-                    single_gw = len(gws) == 1
                     st.dataframe(
                         totals.select(
                             pl.col("web_name").alias("Player"),
-                            pl.col("team_name").alias("Team"),
+                            pl.col("team_name").alias("Club"),
                             pl.col("position").alias("Pos"),
-                            pl.col("price").round(1).alias("£"),
+                            pl.col("price").alias("£m"),
                             pl.col("opponents").alias("Fixtures"),
-                            pl.col("fdr").round(1).alias("FDR"),
-                            pl.col("xp").round(2).alias("xP"),
-                            # The sort key, when it is not xP itself, so the
-                            # table's order is visible rather than implied.
-                            *(
-                                [pl.col(RANK_COL[rank_by]).round(2).alias(rank_by)]
-                                if rank_by != "Total"
-                                else []
-                            ),
-                            pl.col("xp_per_m").round(2).alias("xP/£m"),
-                            *(
-                                [pl.col("ep_next").alias("FPL ep")]
-                                if single_gw
-                                else []
-                            ),
                             pl.col("xmins").round(0).alias("xMins"),
-                            (pl.col("p60") * 100).round(0).alias("P(60) %"),
-                            pl.col("pts_appearance").round(2).alias("Appear"),
-                            pl.col("pts_goals").round(2).alias("Goals"),
-                            pl.col("pts_assists").round(2).alias("Assists"),
-                            pl.col("pts_clean_sheet").round(2).alias("CS"),
-                            pl.col("pts_defcon").round(2).alias("DefCon"),
-                            pl.col("pts_saves").round(2).alias("Saves"),
-                            pl.col("pts_bonus").round(2).alias("Bonus"),
-                            pl.col("pts_conceded").round(2).alias("Conceded"),
-                            pl.col("pts_cards").round(2).alias("Cards"),
-                            pl.col("selected_by_pct").alias("Owned %"),
-                        ).head(200),
-                        hide_index=True,
-                        width="stretch",
-                    )
-                    st.caption(
-                        "**xP** is this model"
-                        + (
-                            "; **FPL ep** is FPL's own figure, shown as a "
-                            "cross-check rather than an input"
-                            if single_gw
-                            else ", summed over every fixture in range"
-                        )
-                        + ". **FDR** is FPL's fixture difficulty, 1 easiest to "
-                        "5, averaged over those fixtures — displayed only, never "
-                        "used in the arithmetic, since the model derives its own "
-                        "club ratings. **xMins** is per match."
+                            pl.col("rating_mu").round(2).alias("Rating"),
+                            pl.col("basis").alias("Basis"),
+                            pl.col("obs_n").alias("Rated"),
+                            (pl.col("p_excellent") * 100).alias("P(10+)"),
+                            (pl.col("p_negative") * 100).alias("P(neg)"),
+                            pl.col("pts_rating").round(2).alias("Rating pts"),
+                            pl.col("pts_goal_bonus").round(2).alias("Goal bonus"),
+                            pl.col("xp").round(2).alias("xP"),
+                            pl.col("xp_per_m").round(2).alias("xP/£m"),
+                        ),
+                        hide_index=True, width="stretch",
+                        column_config={
+                            "Basis": st.column_config.TextColumn(
+                                "Basis",
+                                help="prior = model guesses only · blended = "
+                                     "some recorded ratings · observed = mostly "
+                                     "the player's own history.",
+                            ),
+                            "Rated": st.column_config.NumberColumn(
+                                "Rated", help="Ratings recorded for this player.",
+                            ),
+                            "P(10+)": st.column_config.ProgressColumn(
+                                "P(10+)", format="%.0f%%", min_value=0.0, max_value=100.0,
+                                help="Chance of an excellent return in the range.",
+                            ),
+                            "P(neg)": st.column_config.ProgressColumn(
+                                "P(neg)", format="%.0f%%", min_value=0.0, max_value=100.0,
+                                help="Chance of a negative return. The table pays "
+                                     "down to −4, so this is a real cost.",
+                            ),
+                        },
                     )
 
-                    with st.expander("Club ratings behind these numbers"):
-                        strength = _strength()
-                        if strength.is_empty():
-                            st.caption("Not enough finished fixtures yet.")
-                        else:
-                            st.caption(
-                                "Attack and defence are league-relative: 1.00 is "
-                                "average, higher attack is better, higher defence "
-                                "is leakier. Both are shrunk toward 1.00 by how "
-                                "few matches they rest on, which is why they "
-                                "cluster early in a season."
-                            )
-                            st.dataframe(
-                                strength.select(
-                                    pl.col("team_name").alias("Team"),
-                                    pl.col("matches").alias("Played"),
-                                    pl.col("xg_pm").round(2).alias("xG / match"),
-                                    pl.col("xgc_pm").round(2).alias("xGC / match"),
-                                    pl.col("attack").round(3).alias("Attack"),
-                                    pl.col("defence").round(3).alias("Defence"),
-                                ),
-                                hide_index=True,
-                                width="stretch",
-                            )
+        with st.expander("Record what players actually returned", expanded=rated == 0):
+            st.caption(
+                "The one thing the FPL feed cannot supply, and the only route "
+                "from an ordering to a number. Enter the Sofascore rating "
+                "wherever you can see it: a recorded rating feeds the "
+                "projection directly and starts displacing the model's guesses "
+                "for that player straight away, while points alone only help a "
+                "later fit."
+            )
+            last_done = max(1, min(gw_options) - 1)
+            rec_gw = st.number_input("Gameweek", 1, 38, last_done, step=1, key="rec_gw")
+            blank = pl.DataFrame(
+                {"player": ["", "", ""], "rating": [None] * 3, "points": [None] * 3},
+                schema={"player": pl.Utf8, "rating": pl.Float64, "points": pl.Int32},
+            )
+            edited = st.data_editor(
+                blank, num_rows="dynamic", hide_index=True, width="stretch",
+                key="rec_editor",
+                column_config={
+                    "player": st.column_config.TextColumn(
+                        "Player", help="Surname as it appears on the Players tab."
+                    ),
+                    "rating": st.column_config.NumberColumn(
+                        "Sofascore", min_value=3.0, max_value=10.0, step=0.1,
+                        format="%.1f", help="The scale runs 3.0 to 10.0.",
+                    ),
+                    "points": st.column_config.NumberColumn(
+                        "Points", min_value=-4, max_value=40
+                    ),
+                },
+            )
+            if st.button("Save returns", key="rec_save"):
+                rows, unmatched = _resolve_returns(edited, int(rec_gw))
+                if rows:
+                    league.record(rows)
+                    _observed_ratings.clear()
+                    _league_projections.clear()
+                    _calibration.clear()
+                    st.success(f"Recorded {len(rows)} return(s) for GW{int(rec_gw)}.")
+                    st.rerun()
+                if unmatched:
+                    st.warning(
+                        "No player matched: " + ", ".join(unmatched)
+                        + ". Names must match the Players tab."
+                    )
+                if not rows and not unmatched:
+                    st.info("Nothing to save — fill in a player and a rating or points.")
+
+            recorded = _calibration()
+            if not recorded.is_empty():
+                st.caption(f"{recorded.height} return(s) recorded.")
+                st.dataframe(recorded, hide_index=True, width="stretch")
 
 
 with fantasy:

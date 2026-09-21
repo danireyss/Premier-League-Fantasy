@@ -203,6 +203,24 @@ SCHEMAS: dict[str, dict[str, pl.DataType]] = {
         "strength_defence_home": pl.Int32,
         "strength_defence_away": pl.Int32,
     },
+    # The one table the ingest daemon does not write. BeManager scores from the
+    # Sofascore match rating, which no FPL endpoint carries, so what a player
+    # actually returned has to be entered by hand. That is a league's own
+    # results rather than a second stats provider, which is why it does not
+    # break the single-feed rule the rest of the app keeps.
+    #
+    # It is what makes the projection honest. Sofascore's rating is a
+    # machine-learning model weighting each action by context, so no fixed
+    # tariff built on FPL aggregates can reproduce it; the structural estimate
+    # in league.py is a cold start, and these rows are what replace it.
+    "league_scores": {
+        "captured_at": TS,
+        "gw": pl.Int32,
+        "fpl_id": pl.Int32,
+        "web_name": pl.Utf8,
+        "rating": pl.Float64,  # the Sofascore rating, where it is known
+        "points": pl.Int32,    # what the league actually paid
+    },
 }
 
 
